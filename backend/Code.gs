@@ -1,5 +1,5 @@
 /**
- * Money Tracker Pro v4.3.1 | © 2026 Bayu Wicaksono
+ * Money Tracker Pro v4.4.0 | © 2026 Bayu Wicaksono
  */
 
 // [CONFIG] Konfigurasi global spreadsheet dan zona waktu
