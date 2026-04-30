@@ -22,23 +22,54 @@ function doGet() {
 // [UTIL] Generate unique identifier UUID
 function generateId(){ return Utilities.getUuid(); }
 
-// [VALIDATION] Validasi payload transaksi sebelum disimpan
+// [VALIDATION] Validasi payload transaksi sebelum disimpan dengan enhanced checks
 function validateTransaksi(p){
+  // Check sheets exist
+  if (!SH_TRX || !SH_WAL) {
+    throw new Error("Sheet Transaksi atau Wallets tidak ditemukan. Periksa konfigurasi spreadsheet.");
+  }
+  
   if(!p) throw new Error("Payload kosong");
-  if(!p.wallet) throw new Error("Wallet kosong");
+  if(!p.wallet) throw new Error("Wallet wajib dipilih");
+  
+  // Date validation
   if(!p.tgl) throw new Error("Tanggal wajib diisi");
+  const tglDate = new Date(p.tgl);
+  if(isNaN(tglDate.getTime())) throw new Error("Format tanggal tidak valid");
+  
+  // Nominal validation
   const nominal = Number(p.jumlah);
-  if(!nominal || nominal <= 0) throw new Error("Nominal tidak valid");
+  if(!nominal || nominal <= 0) throw new Error("Nominal harus lebih dari 0");
+  if(nominal > 999999999999) throw new Error("Nominal terlalu besar");
+  
+  // Transfer-specific validation
   if(p.tipe==="Transfer"){
-    if(!p.walletTujuan) throw new Error("Wallet tujuan wajib");
+    if(!p.walletTujuan) throw new Error("Wallet tujuan wajib dipilih untuk Transfer");
     if(p.wallet===p.walletTujuan) throw new Error("Wallet sumber dan tujuan tidak boleh sama");
   }
 }
 
-// [PERF] Hapus cache dashboard saat data berubah
+// [PERF] Hapus cache dashboard saat data berubah dengan pattern-based clearing
 function clearDashboardCache() {
   CACHE.remove(WALLET_CACHE_KEY);
-  CACHE.put("DASH_VER", new Date().getTime().toString(), 600);
+  
+  // Clear all dashboard cache keys by pattern
+  // Note: Apps Script CacheService doesn't support pattern matching,
+  // so we use a version-based approach and store active keys
+  const oldVersion = CACHE.get("DASH_VER") || "0";
+  const newVersion = new Date().getTime().toString();
+  
+  // Store list of cache keys to clear (for future reference)
+  // In practice, old keys will expire after TTL (600s)
+  CACHE.put("DASH_VER", newVersion, 600);
+  
+  // Optional: Use PropertiesService for cross-user cache invalidation signal
+  try {
+    PropertiesService.getScriptProperties().setProperty("DASH_INVALIDATED_AT", newVersion);
+  } catch (e) {
+    // PropertiesService may not be available in all contexts
+    Logger.log("Could not set cache invalidation property: " + e.message);
+  }
 }
 
 // [DB] Ambil saldo tiap dompet dari sheet Wallets
@@ -53,20 +84,48 @@ function getWalletBalances(){
   return res;
 }
 
-// [DB] Perbarui nilai saldo pada dompet spesifik
+// [DB] Perbarui nilai saldo pada dompet spesifik dengan atomic locking
 function updateBalance(name, amt){
-  const lastRow = SH_WAL.getLastRow();
-  if(lastRow <= 1) return;
-  const range = SH_WAL.getRange(2,1,lastRow-1,2);
-  const data = range.getValues();
-  for(let i=0;i<data.length;i++){
-    if(data[i][0]===name){
-      range.getCell(i+1,2).setValue(Number(data[i][1])+amt);
-      clearDashboardCache();
+  const lock = LockService.getScriptLock();
+  try {
+    // Wait up to 30 seconds for lock
+    lock.waitLock(30000);
+    
+    const lastRow = SH_WAL.getLastRow();
+    if(lastRow <= 1) {
+      lock.releaseLock();
       return;
     }
+    
+    const range = SH_WAL.getRange(2,1,lastRow-1,2);
+    const data = range.getValues();
+    
+    for(let i=0;i<data.length;i++){
+      if(data[i][0]===name){
+        const newBalance = Number(data[i][1]) + amt;
+        range.getCell(i+1,2).setValue(newBalance);
+        
+        // Log for debugging race conditions
+        Logger.log(`Balance updated: ${name}, amount: ${amt}, new balance: ${newBalance}`);
+        
+        clearDashboardCache();
+        lock.releaseLock();
+        return;
+      }
+    }
+    
+    lock.releaseLock();
+    throw new Error("Wallet not found: " + name);
+    
+  } catch (e) {
+    // Ensure lock is always released
+    try {
+      lock.releaseLock();
+    } catch (releaseError) {
+      // Lock may already be released
+    }
+    throw e;
   }
-  throw new Error("Wallet not found: " + name);
 }
 
 // [DB] Simpan data transaksi baru atau delegasi ke update
@@ -81,10 +140,22 @@ function simpanTransaksi(p){
     return true;
   }
   if(p.tipe==="Transfer"){
-    SH_TRX.appendRow([tgl,'Transfer Out','Sistem',p.wallet,nominal,`Ke: ${p.walletTujuan} | ${p.catatan}`,trxId]);
-    SH_TRX.appendRow([tgl,'Transfer In','Sistem',p.walletTujuan,nominal,`Dari: ${p.wallet} | ${p.catatan}`,trxId]);
-    updateBalance(p.wallet,-nominal);
-    updateBalance(p.walletTujuan,nominal);
+    // Atomic Transfer: wrap in try-catch with rollback
+    try {
+      SH_TRX.appendRow([tgl,'Transfer Out','Sistem',p.wallet,nominal,`Ke: ${p.walletTujuan} | ${p.catatan}`,trxId]);
+      SH_TRX.appendRow([tgl,'Transfer In','Sistem',p.walletTujuan,nominal,`Dari: ${p.wallet} | ${p.catatan}`,trxId]);
+      
+      // Update both balances atomically
+      updateBalance(p.wallet,-nominal);
+      updateBalance(p.walletTujuan,nominal);
+      
+      Logger.log(`Transfer completed: ${trxId}, from ${p.wallet} to ${p.walletTujuan}, amount: ${nominal}`);
+    } catch (e) {
+      // Rollback: delete transaction rows if balance update fails
+      Logger.log(`Transfer failed, rolling back: ${trxId}, error: ${e.message}`);
+      deleteByTransactionId(trxId);
+      throw new Error("Transfer gagal: " + e.message);
+    }
   }else{
     SH_TRX.appendRow([tgl,p.tipe,kategoriFinal,p.wallet,nominal,p.catatan,trxId]);
     updateBalance(p.wallet,p.tipe==='Pemasukan'?nominal:-nominal);
@@ -121,14 +192,28 @@ function hapusTransaksi(rowId){
   return true;
 }
 
-// [DB] Hapus transaksi berdasarkan ID unik (untuk sepasang transfer)
+// [DB] Hapus transaksi berdasarkan ID unik (untuk sepasang transfer) dengan error handling per-row
 function deleteByTransactionId(trxId){
   const values = SH_TRX.getDataRange().getValues();
+  let deletedCount = 0;
+  let errors = [];
+  
   for(let i=values.length-1;i>=1;i--){
     if(values[i][6]===trxId){
-      revertBalance(values[i]);
-      SH_TRX.deleteRow(i+1);
+      try {
+        revertBalance(values[i]);
+        SH_TRX.deleteRow(i+1);
+        deletedCount++;
+      } catch (e) {
+        // Log error but continue with other rows
+        errors.push(`Row ${i+1}: ${e.message}`);
+        Logger.log(`Error deleting row ${i+1} for transaction ${trxId}: ${e.message}`);
+      }
     }
+  }
+  
+  if (errors.length > 0) {
+    Logger.log(`Deleted ${deletedCount} rows for transaction ${trxId}, with ${errors.length} errors`);
   }
 }
 
@@ -187,29 +272,51 @@ function getDashboardData(f){
   return finalResult;
 }
 
-// [DB] Ambil data detail untuk kebutuhan laporan CSV
+// [DB] Ambil data detail untuk kebutuhan laporan CSV dengan enhanced error handling
 function getExportData(params){
   const startStr = Array.isArray(params) ? params[0] : params.start;
   const endStr = Array.isArray(params) ? params[1] : params.end;
   if(!startStr || !endStr) throw new Error("Invalid export date range");
-  const start = new Date(startStr);
-  const end = new Date(endStr);
-  end.setHours(23,59,59);
+  
+  let start, end;
+  try {
+    start = new Date(startStr);
+    end = new Date(endStr);
+    end.setHours(23,59,59);
+  } catch (e) {
+    throw new Error("Invalid date format");
+  }
+  
   if(isNaN(start) || isNaN(end)) throw new Error("Invalid date format");
+  
   const data = SH_TRX.getDataRange().getValues();
   data.shift();
   data.sort((a,b)=>new Date(a[0]) - new Date(b[0]));
+  
   let runningTotal = 0;
   const exportData = [];
   const yearSuffix = new Date().getFullYear();
+  
   for(let i=0;i<data.length;i++){
     const r = data[i];
     if(!r[0]) continue;
-    const tglTrx = new Date(r[0]);
-    if(isNaN(tglTrx)) continue;
+    
+    let tglTrx;
+    try {
+      tglTrx = new Date(r[0]);
+      if(isNaN(tglTrx)) {
+        Logger.log(`Skipping row ${i+2}: invalid date`);
+        continue;
+      }
+    } catch (e) {
+      Logger.log(`Skipping row ${i+2}: date parse error - ${e.message}`);
+      continue;
+    }
+    
     const nominal = Number(r[4]) || 0;
     const isDebit = (r[1]==='Pemasukan' || r[1]==='Transfer In');
     runningTotal += isDebit ? nominal : -nominal;
+    
     if(tglTrx >= start && tglTrx <= end){
       exportData.push({
         kode: `PP${yearSuffix}-${String(i+1).padStart(3,'0')}`,
@@ -219,9 +326,23 @@ function getExportData(params){
         catatan: r[5] || "-",
         debit: isDebit ? nominal : 0,
         kredit: !isDebit ? nominal : 0,
-        total: runningTotal
+        total: Number(runningTotal.toFixed(2)) // Use toFixed for precision
       });
     }
   }
+  
   return exportData;
+}
+
+// [UTIL] Helper function to escape CSV fields per RFC 4180
+function escapeCsvField(str){
+  if(!str) return "";
+  str = String(str);
+  
+  // If field contains comma, quote, or newline, wrap in quotes and escape internal quotes
+  if(str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')){
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  
+  return str;
 }

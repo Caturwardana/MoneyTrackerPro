@@ -217,9 +217,19 @@
 </div>
 
 <script>
-  // [API] Global bridge ke fungsi backend Apps Script
-  function runServer(method, payload, success){
+  // [API] Global bridge ke fungsi backend Apps Script dengan enhanced error handling
+  function runServer(method, payload, success, retryCount = 0){
   loading(true);
+  
+  // Check offline status
+  if (!navigator.onLine) {
+    loading(false);
+    if (confirm("Anda sedang offline. Periksa koneksi internet Anda dan coba lagi?")) {
+      runServer(method, payload, success, retryCount);
+    }
+    return;
+  }
+  
   const runner = google.script.run
     .withSuccessHandler(res=>{
       loading(false);
@@ -227,8 +237,43 @@
     })
     .withFailureHandler(err=>{
       loading(false);
-      alert(err.message || "Terjadi error server");
+      
+      // Enhanced error handling with specific messages
+      let errorMessage = err.message || "Terjadi error server";
+      let isRetryable = false;
+      
+      // Detect error types
+      if (errorMessage.includes("timeout") || errorMessage.includes("Timeout")) {
+        errorMessage = "Koneksi timeout. Server membutuhkan waktu terlalu lama untuk merespons.";
+        isRetryable = true;
+      } else if (errorMessage.includes("network") || errorMessage.includes("Network")) {
+        errorMessage = "Terjadi kesalahan jaringan. Periksa koneksi internet Anda.";
+        isRetryable = true;
+      } else if (errorMessage.includes("Nominal tidak valid") || errorMessage.includes("Wallet") || errorMessage.includes("Tanggal")) {
+        errorMessage = "Validasi gagal: " + errorMessage;
+        isRetryable = false;
+      } else if (errorMessage.includes("not found") || errorMessage.includes("tidak ditemukan")) {
+        errorMessage = "Data tidak ditemukan: " + errorMessage;
+        isRetryable = false;
+      }
+      
+      // Show error with retry option for transient failures
+      if (isRetryable && retryCount < 3) {
+        const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 5000); // Exponential backoff: 1s, 2s, 4s
+        const shouldRetry = confirm(errorMessage + `\n\nCoba lagi? (Percobaan ${retryCount + 1}/3)`);
+        
+        if (shouldRetry) {
+          setTimeout(() => {
+            runServer(method, payload, success, retryCount + 1);
+          }, retryDelay);
+          return;
+        }
+      }
+      
+      // Show final error message
+      alert(errorMessage);
     });
+  
   if(payload === undefined || payload === null) runner[method]();
   else runner[method](payload);
   }
@@ -242,7 +287,7 @@
   // [STATE] Global state management aplikasi
   let hF = { tipe: 'Semua', start: '', end: '' }, sF = { tipe: 'Pengeluaran', start: '', end: '' }, chartObj = null;
   let allTrx = [], curPage = 1, walBalArr = []; const rows = 10;
-  let startX = 0, currentX = 0, isDragging = false, deleteIdxTemp = null;
+  let startX = 0, startY = 0, currentX = 0, isDragging = false, deleteIdxTemp = null;
   let searchQuery = ""; 
 
   // [CONFIG] Map kategori, warna, dan icon
@@ -273,17 +318,113 @@
   // [UI] Tampilkan toast sukses melayang
   function showToast() { const toastEl = document.getElementById('toastSuccess'); const toast = new bootstrap.Toast(toastEl, { delay: 3000 }); toast.show(); }
   
+  // [UI] Reset form state untuk mencegah data lama tersisa
+  function resetForm() {
+    document.getElementById('mainForm').reset();
+    document.getElementById('editRowId').value = "";
+    document.getElementById('editRowId').dataset.trxid = "";
+    document.getElementById('btn-submit').innerText = "SIMPAN TRANSAKSI";
+    document.getElementById('kat-kustom-area').style.display = 'none';
+    document.getElementById('tujuan-area').style.display = 'none';
+    setDefaultDate();
+  }
+  
   // [UI] Update tampilan saldo dompet terpilih di form
   function updateSaldoDisplay() { const sel = document.getElementById('wallet').value; const found = walBalArr.find(w => w.name === sel); document.getElementById('display-saldo').innerText = `Saldo - Rp ${new Intl.NumberFormat('id-ID').format(found ? found.balance : 0)}`; }
 
-  // [UX] Gesture: Inisialisasi swipe pada baris transaksi
-  function ts(e, i) { startX = e.touches[0].clientX; isDragging = true; const wrapper = document.getElementById(`card-${i}`).parentElement; wrapper.querySelectorAll('.slide-action').forEach(el => { el.style.visibility = 'visible'; el.style.opacity = '1'; }); }
+  // [UX] Gesture: Inisialisasi swipe pada baris transaksi dengan direction detection
+  let startY = 0; // Add startY for vertical detection
   
-  // [UX] Gesture: Handle pergeseran swipe saat jari bergerak
-  function tm(e, i) { if (!isDragging) return; currentX = e.touches[0].clientX - startX; const card = document.getElementById(`card-${i}`); if (currentX > 0) card.style.transform = `translateX(${Math.min(currentX, 100)}px)`; else card.style.transform = `translateX(${Math.max(currentX, -100)}px)`; }
+  function ts(e, i) {
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY; // Track Y position
+    isDragging = true;
+    const wrapper = document.getElementById(`card-${i}`).parentElement;
+    wrapper.querySelectorAll('.slide-action').forEach(el => {
+      el.style.visibility = 'visible';
+      el.style.opacity = '1';
+    });
+  }
   
-  // [UX] Gesture: Finalisasi posisi swipe saat jari diangkat
-  function te(e, i) { isDragging = false; const card = document.getElementById(`card-${i}`); if (currentX > 60) card.style.transform = `translateX(100px)`; else if (currentX < -60) card.style.transform = `translateX(-100px)`; else { card.style.transform = `translateX(0)`; setTimeout(() => { const wrapper = card.parentElement; wrapper.querySelectorAll('.slide-action').forEach(el => { el.style.opacity = '0'; el.style.visibility = 'hidden'; }); }, 200); } currentX = 0; }
+  // [UX] Gesture: Handle pergeseran swipe saat jari bergerak dengan smart direction detection
+  function tm(e, i) {
+    if (!isDragging) return;
+    
+    const currentTouchX = e.touches[0].clientX;
+    const currentTouchY = e.touches[0].clientY;
+    
+    const deltaX = currentTouchX - startX;
+    const deltaY = currentTouchY - startY;
+    
+    // Direction detection: only activate swipe if horizontal intent
+    if (Math.abs(deltaY) > Math.abs(deltaX)) {
+      // Vertical scroll detected, don't activate swipe
+      return;
+    }
+    
+    // Horizontal swipe detected
+    currentX = deltaX;
+    const card = document.getElementById(`card-${i}`);
+    
+    if (currentX > 0) {
+      card.style.transform = `translateX(${Math.min(currentX, 100)}px)`;
+    } else {
+      card.style.transform = `translateX(${Math.max(currentX, -100)}px)`;
+    }
+  }
+  
+  // [UX] Gesture: Finalisasi posisi swipe saat jari diangkat dengan cleanup
+  function te(e, i) {
+    isDragging = false;
+    const card = document.getElementById(`card-${i}`);
+    
+    if (!card) return; // Safety check
+    
+    // Velocity threshold: require minimum 60px swipe
+    if (currentX > 60) {
+      card.style.transform = `translateX(100px)`;
+    } else if (currentX < -60) {
+      card.style.transform = `translateX(-100px)`;
+    } else {
+      // Reset if threshold not met
+      card.style.transform = `translateX(0)`;
+      setTimeout(() => {
+        const wrapper = card.parentElement;
+        if (wrapper) {
+          wrapper.querySelectorAll('.slide-action').forEach(el => {
+            el.style.opacity = '0';
+            el.style.visibility = 'hidden';
+          });
+        }
+      }, 200);
+    }
+    
+    // Reset state
+    currentX = 0;
+    startX = 0;
+    startY = 0;
+  }
+  
+  // [UX] Gesture: Handle touch cancel event for cleanup
+  function tc(e, i) {
+    // Cleanup on interrupted touch
+    isDragging = false;
+    currentX = 0;
+    startX = 0;
+    startY = 0;
+    
+    const card = document.getElementById(`card-${i}`);
+    if (card) {
+      card.style.transform = `translateX(0)`;
+      const wrapper = card.parentElement;
+      if (wrapper) {
+        wrapper.querySelectorAll('.slide-action').forEach(el => {
+          el.style.opacity = '0';
+          el.style.visibility = 'hidden';
+        });
+      }
+    }
+  }
 
   // [UI] Muat data transaksi lama ke dalam form edit
   function handleEdit(idx) { const t = allTrx[idx]; document.getElementById('tipe').value = t.tipe.includes('Transfer') ? 'Transfer' : t.tipe; toggleUI(); const kategoriSelect = document.getElementById('kategori'); const options = Array.from(kategoriSelect.options).map(opt => opt.value); if (options.includes(t.kat)) { kategoriSelect.value = t.kat; document.getElementById('kat-kustom-area').style.display = 'none'; } else { kategoriSelect.value = 'Lainnya'; document.getElementById('kategoriKustom').value = t.kat; document.getElementById('kat-kustom-area').style.display = 'block'; } document.getElementById('wallet').value = t.wallet; document.getElementById('catatan').value = t.note; document.getElementById('jumlah').value = "Rp " + t.nominal.toLocaleString('id-ID'); document.getElementById('tglInput').value = t.tglRaw; document.getElementById('editRowId').value = t.row; document.getElementById('editRowId').dataset.trxid = t.trxId || ""; document.getElementById('btn-submit').innerText = "UPDATE TRANSAKSI"; document.getElementById('tab-in-btn').click(); document.getElementById(`card-${idx}`).style.transform = 'translateX(0)'; }
@@ -300,38 +441,241 @@
   // [API] Ambil riwayat transaksi terbaru dari server
   function fetchTransactions() { runServer("getTransactions", hF, data=>{ allTrx=data; curPage=1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx();}); }
   
-  // [UI] Render dashboard statistik dan chart donat
-  function fetchDashboard() { runServer("getDashboardData", sF, data=>{ document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); }); }
+  // [UI] Render dashboard statistik dan chart donat dengan robust error handling
+  function fetchDashboard() {
+    runServer("getDashboardData", sF, data=>{
+      document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID');
+      document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join('');
+      
+      const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]);
+      const val = sortK.map(l => data.catStats[l]);
+      const col = sortK.map(l => getDynamicColor(l));
+      const tot = data.totalFiltered;
+      
+      // Null check before destroy
+      if (chartObj) {
+        try {
+          chartObj.destroy();
+        } catch (e) {
+          console.log('Error destroying chart:', e);
+        }
+      }
+      
+      // Empty state handling
+      if (sortK.length === 0 || tot === 0) {
+        document.getElementById('myChart').parentElement.innerHTML = '<div class="d-flex align-items-center justify-content-center" style="height:230px;"><p class="text-center small opacity-50 fw-bold">Belum ada data untuk periode ini</p></div>';
+        document.getElementById('cat-list').innerHTML = '<p class="text-center py-3 small opacity-50 fw-bold">Tidak ada kategori untuk ditampilkan</p>';
+        chartObj = null;
+        return;
+      }
+      
+      // Restore canvas if it was replaced
+      if (!document.getElementById('myChart')) {
+        document.querySelector('#tab-st .glass-card > div').innerHTML = '<canvas id="myChart"></canvas>';
+      }
+      
+      chartObj = new Chart(document.getElementById('myChart'), {
+        type: 'doughnut',
+        data: {
+          labels: sortK,
+          datasets: [{
+            data: val,
+            backgroundColor: col,
+            borderWidth: 0
+          }]
+        },
+        options: {
+          cutout: '82%',
+          plugins: {
+            legend: { display: false }
+          },
+          maintainAspectRatio: false
+        },
+        plugins: [{
+          beforeDraw: (c) => {
+            const { ctx, width, height } = c;
+            ctx.restore();
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = '800 1.1rem Plus Jakarta Sans';
+            ctx.fillStyle = '#1e293b';
+            ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2);
+            ctx.save();
+          }
+        }]
+      });
+      
+      document.getElementById('cat-list').innerHTML = sortK.map((l, i) => {
+        // Explicit zero check for percentage calculation
+        const p = (tot > 0 && val[i] > 0) ? ((val[i] / tot) * 100).toFixed(0) : 0;
+        return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`;
+      }).join('');
+    });
+  }
   
-  // [API] Ambil daftar dompet dan saldo untuk dropdown
-  function loadWallets(){runServer("getWalletBalances",null,res=>{walBalArr=res;const opts=res.map(w=>{const safe=escapeHtml(w.name);return `<option value="${safe}">${safe}</option>`}).join('');document.getElementById('wallet').innerHTML=opts;document.getElementById('walletTujuan').innerHTML=opts;updateSaldoDisplay();});}
+  // [API] Ambil daftar dompet dan saldo untuk dropdown dengan preservation
+  function loadWallets(){
+    runServer("getWalletBalances",null,res=>{
+      walBalArr=res;
+      
+      // Preserve selected wallet if still valid
+      const currentWallet = document.getElementById('wallet').value;
+      const currentWalletTujuan = document.getElementById('walletTujuan').value;
+      
+      const opts=res.map(w=>{
+        const safe=escapeHtml(w.name);
+        return `<option value="${safe}">${safe}</option>`;
+      }).join('');
+      
+      document.getElementById('wallet').innerHTML=opts;
+      document.getElementById('walletTujuan').innerHTML=opts;
+      
+      // Restore selection if wallet still exists
+      if (currentWallet && res.some(w => w.name === currentWallet)) {
+        document.getElementById('wallet').value = currentWallet;
+      }
+      if (currentWalletTujuan && res.some(w => w.name === currentWalletTujuan)) {
+        document.getElementById('walletTujuan').value = currentWalletTujuan;
+      }
+      
+      updateSaldoDisplay();
+    });
+  }
 
-  // [EVENT] Handle pencarian real-time pada riwayat
-  function handleSearch(val) { searchQuery = val.toLowerCase(); curPage = 1; renderTrx(); }
+  // [EVENT] Handle pencarian real-time pada riwayat dengan special char escaping
+  function handleSearch(val) {
+    // Escape special regex characters
+    searchQuery = val.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    curPage = 1;
+    renderTrx();
+  }
 
   // [UI] Render daftar transaksi dengan pagination dan filter search
   function renderTrx() {
     const list = document.getElementById('transaction-list'), pag = document.getElementById('pagination-ctrl');
     let dataToRender = allTrx.map((t, index) => ({ ...t, originalIdx: index }));
     if (searchQuery) dataToRender = dataToRender.filter(t => t.kat.toLowerCase().includes(searchQuery) || (t.note && t.note.toLowerCase().includes(searchQuery)) || t.nominal.toString().includes(searchQuery));
-    if (!dataToRender.length) { list.innerHTML = '<p class="text-center py-5 small opacity-50 fw-bold">Belum ada data transaksi</p>'; pag.style.setProperty('display', 'none', 'important'); return; }
+    
+    // Differentiated empty state messages
+    if (!dataToRender.length) {
+      if (searchQuery || hF.tipe !== 'Semua') {
+        list.innerHTML = '<p class="text-center py-5 small opacity-50 fw-bold">Tidak ada hasil untuk filter ini</p>';
+      } else if (allTrx.length === 0) {
+        list.innerHTML = '<p class="text-center py-5 small opacity-50 fw-bold">Belum ada transaksi. Mulai tambahkan transaksi pertama Anda!</p>';
+      } else {
+        list.innerHTML = '<p class="text-center py-5 small opacity-50 fw-bold">Belum ada data transaksi</p>';
+      }
+      pag.style.setProperty('display', 'none', 'important');
+      return;
+    }
     pag.style.setProperty('display', 'flex', 'important');
     const totalPages = Math.ceil(dataToRender.length / rows);
     const slice = dataToRender.slice((curPage - 1) * rows, curPage * rows);
     list.innerHTML = slice.map((t) => {
       const realIdx = t.originalIdx; const isInc = t.tipe.includes('In') || t.tipe === 'Pemasukan'; const col = getDynamicColor(t.kat);
-      return `<div class="trx-item-wrapper"><div class="slide-action action-edit" onclick="handleEdit(${realIdx})">EDIT</div><div class="slide-action action-delete" onclick="handleDelete(${realIdx})">HAPUS</div><div class="trx-card-old" id="card-${realIdx}" style="border-left-color: ${col}" ontouchstart="ts(event, ${realIdx})" ontouchmove="tm(event, ${realIdx})" ontouchend="te(event, ${realIdx})"><div class="cat-icon-box" style="background:${col}15; color:${col}">${getDynamicIcon(t.kat)}</div><div class="flex-grow-1"><div class="small fw-bold">${escapeHtml(t.kat)}</div><div class="text-muted" style="font-size:0.7rem; line-height:1.2; margin-bottom:2px;">${escapeHtml(t.note || '-')}</div><div class="text-muted" style="font-size:0.6rem; opacity:0.8;">${t.tgl} • ${escapeHtml(t.wallet)}</div></div><div class="fw-800 ${isInc ? 'text-success' : 'text-danger'} text-nowrap ms-2" style="font-size:0.9rem">${isInc ? '+' : '-'} Rp ${(t.nominal||0).toLocaleString('id-ID')}</div></div></div>`;
+      return `<div class="trx-item-wrapper"><div class="slide-action action-edit" onclick="handleEdit(${realIdx})">EDIT</div><div class="slide-action action-delete" onclick="handleDelete(${realIdx})">HAPUS</div><div class="trx-card-old" id="card-${realIdx}" style="border-left-color: ${col}" ontouchstart="ts(event, ${realIdx})" ontouchmove="tm(event, ${realIdx})" ontouchend="te(event, ${realIdx})" ontouchcancel="tc(event, ${realIdx})"><div class="cat-icon-box" style="background:${col}15; color:${col}">${getDynamicIcon(t.kat)}</div><div class="flex-grow-1"><div class="small fw-bold">${escapeHtml(t.kat)}</div><div class="text-muted" style="font-size:0.7rem; line-height:1.2; margin-bottom:2px;">${escapeHtml(t.note || '-')}</div><div class="text-muted" style="font-size:0.6rem; opacity:0.8;">${t.tgl} • ${escapeHtml(t.wallet)}</div></div><div class="fw-800 ${isInc ? 'text-success' : 'text-danger'} text-nowrap ms-2" style="font-size:0.9rem">${isInc ? '+' : '-'} Rp ${(t.nominal||0).toLocaleString('id-ID')}</div></div></div>`;
     }).join('');
     document.getElementById('pageDisplay').innerText = `${curPage} / ${totalPages}`;
     document.getElementById('btn-prev').disabled = (curPage === 1);
     document.getElementById('btn-next').disabled = (curPage === totalPages);
   }
 
-  // [EVENT] Handle submit form transaksi (Simpan/Update)
-  function handleSave(e) { e.preventDefault(); if (document.getElementById('kategori').value === 'Lainnya' && !document.getElementById('kategoriKustom').value.trim()) { alert("Isi kategori!"); return; } const p = { tipe: document.getElementById('tipe').value, kategori: document.getElementById('kategori').value, kategoriKustom: document.getElementById('kategoriKustom').value, wallet: document.getElementById('wallet').value, walletTujuan: document.getElementById('walletTujuan').value, jumlah: document.getElementById('jumlah').value.replace(/[^0-9]/g, ""), catatan: document.getElementById('catatan').value, tgl: document.getElementById('tglInput').value, rowId: document.getElementById('editRowId').value, trxId: document.getElementById('editRowId').dataset.trxid || "" }; runServer("simpanTransaksi", p, ()=>{ document.getElementById('mainForm').reset(); document.getElementById('editRowId').value = ""; document.getElementById('editRowId').dataset.trxid = ""; document.getElementById('btn-submit').innerText = "SIMPAN TRANSAKSI"; setDefaultDate(); toggleUI(); loadWallets(); fetchTransactions(); showToast(); }); }
+  // [EVENT] Handle submit form transaksi (Simpan/Update) dengan enhanced validation
+  function handleSave(e) {
+    e.preventDefault();
+    
+    // Validation 1: Custom category check
+    if (document.getElementById('kategori').value === 'Lainnya' && !document.getElementById('kategoriKustom').value.trim()) {
+      alert("Isi kategori!");
+      return;
+    }
+    
+    // Validation 2: Nominal validation
+    const nominalInput = document.getElementById('jumlah').value.replace(/[^0-9]/g, "");
+    const nominal = Number(nominalInput);
+    
+    if (!nominalInput || nominal <= 0) {
+      alert("Nominal harus lebih dari 0!");
+      document.getElementById('jumlah').style.borderColor = '#ef4444';
+      setTimeout(() => {
+        document.getElementById('jumlah').style.borderColor = '';
+      }, 2000);
+      return;
+    }
+    
+    // Validation 3: Date validation
+    const tglInput = document.getElementById('tglInput').value;
+    if (!tglInput) {
+      alert("Tanggal wajib diisi!");
+      return;
+    }
+    
+    // Validation 4: Wallet validation for Transfer
+    const tipe = document.getElementById('tipe').value;
+    if (tipe === 'Transfer') {
+      const walletSource = document.getElementById('wallet').value;
+      const walletDest = document.getElementById('walletTujuan').value;
+      
+      if (walletSource === walletDest) {
+        alert("Wallet sumber dan tujuan tidak boleh sama!");
+        return;
+      }
+    }
+    
+    // All validations passed, proceed with save
+    const p = {
+      tipe: tipe,
+      kategori: document.getElementById('kategori').value,
+      kategoriKustom: document.getElementById('kategoriKustom').value,
+      wallet: document.getElementById('wallet').value,
+      walletTujuan: document.getElementById('walletTujuan').value,
+      jumlah: nominalInput,
+      catatan: document.getElementById('catatan').value,
+      tgl: tglInput,
+      rowId: document.getElementById('editRowId').value,
+      trxId: document.getElementById('editRowId').dataset.trxid || ""
+    };
+    
+    runServer("simpanTransaksi", p, ()=>{
+      document.getElementById('mainForm').reset();
+      document.getElementById('editRowId').value = "";
+      document.getElementById('editRowId').dataset.trxid = "";
+      document.getElementById('btn-submit').innerText = "SIMPAN TRANSAKSI";
+      setDefaultDate();
+      toggleUI();
+      loadWallets();
+      fetchTransactions();
+      showToast();
+    });
+  }
   
-  // [UI] Sesuaikan input kategori berdasarkan tipe transaksi
-  function toggleUI() { const t = document.getElementById('tipe').value; document.getElementById('kat-area').style.display = t === 'Transfer' ? 'none' : 'block'; document.getElementById('tujuan-area').style.display = t === 'Transfer' ? 'block' : 'none'; const cats = (t === 'Pemasukan') ? ["Gaji", "Bisnis", "Investasi", "Hadiah", "Fintech", "Lainnya"] : ["Makan & Minum", "Transportasi", "Belanja", "Tempat Tinggal", "Keluarga", "Hiburan", "Fintech", "Kesehatan", "Teman", "Hewan Peliharaan", "Keuangan", "Pribadi", "Sistem", "Lainnya"]; document.getElementById('kategori').innerHTML = cats.map(k => `<option value="${k}">${k}</option>`).join(''); checkLainnya(); }
+  // [UI] Sesuaikan input kategori berdasarkan tipe transaksi dengan preservation
+  function toggleUI() {
+    const t = document.getElementById('tipe').value;
+    document.getElementById('kat-area').style.display = t === 'Transfer' ? 'none' : 'block';
+    document.getElementById('tujuan-area').style.display = t === 'Transfer' ? 'block' : 'none';
+    
+    // Preserve custom category value if in edit mode
+    const isEditMode = document.getElementById('editRowId').value !== "";
+    const currentKategori = document.getElementById('kategori').value;
+    const currentKustom = document.getElementById('kategoriKustom').value;
+    
+    const cats = (t === 'Pemasukan') ? ["Gaji", "Bisnis", "Investasi", "Hadiah", "Fintech", "Lainnya"] : ["Makan & Minum", "Transportasi", "Belanja", "Tempat Tinggal", "Keluarga", "Hiburan", "Fintech", "Kesehatan", "Teman", "Hewan Peliharaan", "Keuangan", "Pribadi", "Sistem", "Lainnya"];
+    
+    document.getElementById('kategori').innerHTML = cats.map(k => `<option value="${k}">${k}</option>`).join('');
+    
+    // Restore category selection if in edit mode
+    if (isEditMode && currentKategori) {
+      if (cats.includes(currentKategori)) {
+        document.getElementById('kategori').value = currentKategori;
+      } else if (currentKustom) {
+        document.getElementById('kategori').value = 'Lainnya';
+        document.getElementById('kategoriKustom').value = currentKustom;
+      }
+    }
+    
+    checkLainnya();
+  }
   
   // [UI] Tampilkan input teks jika memilih kategori 'Lainnya'
   function checkLainnya() { document.getElementById('kat-kustom-area').style.display = document.getElementById('kategori').value === 'Lainnya' ? 'block' : 'none'; }
@@ -357,14 +701,51 @@
   // [UTIL] Set nilai default input tanggal ke waktu sekarang
   function setDefaultDate() { const now = new Date(); now.setMinutes(now.getMinutes() - now.getTimezoneOffset()); document.getElementById('tglInput').value = now.toISOString().slice(0, 16); }
   
-  // [API] Ambil pratinjau data untuk kebutuhan ekspor
-  function processExport(){const s=document.getElementById('ex-start').value,e=document.getElementById('ex-end').value;if(!s||!e){alert("Pilih tanggal!");return;}runServer("getExportData",[s,e],data=>{document.getElementById('export-preview-area').style.setProperty('display','block','important');document.getElementById('export-body').innerHTML=data.map(r=>`<tr><td>${r.kode}</td><td>${r.tgl}</td><td>${escapeHtml(r.wallet)}</td><td>${escapeHtml(r.keterangan)}</td><td>${escapeHtml(r.catatan)}</td><td class="text-success">${r.debit?'Rp '+r.debit.toLocaleString('id-ID'):'-'}</td><td class="text-danger">${r.kredit?'Rp '+r.kredit.toLocaleString('id-ID'):'-'}</td><td>Rp ${r.total.toLocaleString('id-ID')}</td></tr>`).join('');});}
+  // [API] Ambil pratinjau data untuk kebutuhan ekspor dengan empty data handling
+  function processExport(){
+    const s=document.getElementById('ex-start').value;
+    const e=document.getElementById('ex-end').value;
+    
+    if(!s||!e){
+      alert("Pilih tanggal!");
+      return;
+    }
+    
+    runServer("getExportData",[s,e],data=>{
+      // Check if data is empty
+      if (!data || data.length === 0) {
+        alert("Tidak ada transaksi dalam periode yang dipilih. Silakan pilih rentang tanggal lain.");
+        document.getElementById('export-preview-area').style.display = 'none';
+        return;
+      }
+      
+      document.getElementById('export-preview-area').style.setProperty('display','block','important');
+      document.getElementById('export-body').innerHTML=data.map(r=>`<tr><td>${r.kode}</td><td>${r.tgl}</td><td>${escapeHtml(r.wallet)}</td><td>${escapeHtml(r.keterangan)}</td><td>${escapeHtml(r.catatan)}</td><td class="text-success">${r.debit?'Rp '+r.debit.toLocaleString('id-ID'):'-'}</td><td class="text-danger">${r.kredit?'Rp '+r.kredit.toLocaleString('id-ID'):'-'}</td><td>Rp ${r.total.toLocaleString('id-ID')}</td></tr>`).join('');
+    });
+  }
   
   // [UTIL] Generate dan download file CSV dari tabel pratinjau
   function downloadCSV() { const table = document.getElementById("table-export"); let csv = []; for (let i = 0; i < table.rows.length; i++) { let row = [], cols = table.rows[i].querySelectorAll("td, th"); for (let j = 0; j < cols.length; j++) row.push('"' + cols[j].innerText.replace(/Rp\s?|(?<=\d)\.(?=\d{3})/g, '').replace(/\n/g, ' ') + '"'); csv.push(row.join(",")); } const blob = new Blob(["\uFEFF" + csv.join("\n")], { type: "text/csv;charset=utf-8;" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Export_${new Date().getTime()}.csv`; document.body.appendChild(link); link.click(); document.body.removeChild(link); }
 
   // [INIT] Jalankan fungsi inisialisasi saat window dimuat
-  window.onload = () => { setDefaultDate(); loadWallets(); updateHDate(30); updateSDate(30); toggleUI(); };
+  window.onload = () => {
+    setDefaultDate();
+    loadWallets();
+    updateHDate(30);
+    updateSDate(30);
+    toggleUI();
+    
+    // Add tab change listeners to reset form
+    const tabButtons = document.querySelectorAll('#mainTab button[data-bs-toggle="pill"]');
+    tabButtons.forEach(btn => {
+      btn.addEventListener('shown.bs.tab', (event) => {
+        // Reset form when switching away from Input tab
+        if (event.relatedTarget && event.relatedTarget.getAttribute('data-bs-target') === '#tab-in') {
+          resetForm();
+        }
+      });
+    });
+  };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
