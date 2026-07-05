@@ -23,6 +23,19 @@ const CACHE_TTL_SECONDS = 600;
 
 function ensureAppSetup() {
   if (APP_SETUP_RUNNING) return;
+  // Fast-path: if setup ran recently, skip heavy operations
+  try {
+    if (CACHE.get('SETUP_DONE') === 'true') {
+      // If setup already ran recently, ensure quick references exist.
+      if (!SS) SS = SpreadsheetApp.getActiveSpreadsheet();
+      SH_TRX = SH_TRX || SS.getSheetByName('Transaksi');
+      SH_WAL = SH_WAL || SS.getSheetByName('Wallets');
+      SH_USR = SH_USR || SS.getSheetByName('Users');
+      SH_CAT = SH_CAT || SS.getSheetByName('Kategori');
+      // If all sheets are present, skip heavy setup. Otherwise continue to full setup.
+      if (SH_TRX && SH_WAL && SH_USR && SH_CAT) return;
+    }
+  } catch (e) {}
   APP_SETUP_RUNNING = true;
   try {
     if (!SS) {
@@ -58,6 +71,8 @@ function ensureAppSetup() {
       migrateLegacyData();
       PROP.setProperty(MIGRATION_DONE_KEY, 'true');
     }
+    // mark setup as done for a short period to avoid repeated sheet introspection
+    try { CACHE.put('SETUP_DONE', 'true', 3600); } catch (e) {}
   } finally {
     APP_SETUP_RUNNING = false;
   }
@@ -475,8 +490,9 @@ function getTransactions(f) {
     const matchTipe = f && f.tipe === 'Semua' ? true : r[1] === f.tipe || (f.tipe === 'Pemasukan' && r[1] === 'Transfer In') || (f.tipe === 'Pengeluaran' && r[1] === 'Transfer Out');
     if (d >= start && d <= end && matchTipe) {
       result.push({
-        tgl: Utilities.formatDate(r[0], TZ, 'dd/MM'),
-        tglRaw: Utilities.formatDate(r[0], TZ, 'yyyy-MM-dd\'T\'HH:mm'),
+        // Use plain Date methods to avoid heavy Utilities.formatDate calls inside loops
+        tgl: (function(dt){ const d=new Date(dt); const dd=('0'+d.getDate()).slice(-2); const mm=('0'+(d.getMonth()+1)).slice(-2); return dd + '/' + mm; })(r[0]),
+        tglRaw: (function(dt){ const d=new Date(dt); const yyyy=d.getFullYear(); const mm=('0'+(d.getMonth()+1)).slice(-2); const dd=('0'+d.getDate()).slice(-2); const hh=('0'+d.getHours()).slice(-2); const min=('0'+d.getMinutes()).slice(-2); return `${yyyy}-${mm}-${dd}T${hh}:${min}`; })(r[0]),
         tipe: r[1],
         kat: r[2],
         wallet: r[3],
