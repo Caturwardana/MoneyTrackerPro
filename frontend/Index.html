@@ -371,8 +371,22 @@
     const pin = document.getElementById('pinInput').value.trim();
     if (!pin) { alert('PIN wajib diisi'); return; }
     invalidateFrontendCache();
-    runServer('verifyPin', pin, (user) => {
-      currentUser = user;
+    // Use loginInit to fetch user, master data, transactions and dashboard in one call
+    runServer('loginInit', pin, (res) => {
+      currentUser = res.user;
+      // Inject master data directly to frontend memory and cache
+      masterData = { users: res.users || [], categories: (res.masterData && res.masterData.categories) || [], wallets: (res.masterData && res.masterData.wallets) || [] };
+      const masterCacheKey = `master:${currentUser.id}`;
+      setCachedValue(masterCacheKey, masterData, FRONTEND_CACHE_TTL.master);
+
+      // Pre-cache transactions and dashboard so subsequent calls are instant
+      try {
+        setCachedValue(`transactions:${currentUser.id}:${JSON.stringify(hF)}`, res.transactions || [], FRONTEND_CACHE_TTL.transactions);
+      } catch (e) {}
+      try {
+        setCachedValue(`dashboard:${currentUser.id}:${JSON.stringify(sF)}`, res.dashboard || {}, FRONTEND_CACHE_TTL.dashboard);
+      } catch (e) {}
+
       document.getElementById('pinInput').value = '';
       showAppShell();
       initializeAfterLogin();
