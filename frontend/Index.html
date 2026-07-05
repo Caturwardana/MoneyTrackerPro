@@ -223,7 +223,7 @@
         </div>
         <div class="mb-3">
           <label class="form-label-custom">Tambah Sumber Dana</label>
-          <input type="text" class="form-control mb-2" id="walletNameInput" placeholder="Contoh: Kas, Rekening, E-Wallet">
+          <input type="text" class="form-control mb-2" id="walletNameInput" placeholder="Contoh: Cash, Rekening, E-Wallet">
           <input type="text" class="form-control mb-2" id="walletBalanceInput" placeholder="Saldo awal (opsional)">
           <button class="btn btn-dark w-100 rounded-4 fw-bold" onclick="saveWalletFromForm()">Simpan Sumber Dana</button>
         </div>
@@ -268,20 +268,43 @@
 
 <script>
   // [API] Global bridge ke fungsi backend Apps Script
-  function runServer(method, payload, success){
-  loading(true);
-  const runner = google.script.run
-    .withSuccessHandler(res=>{
-      loading(false);
-      success && success(res);
-    })
-    .withFailureHandler(err=>{
-      loading(false);
-      alert(err.message || "Terjadi error server");
-    });
-  if(payload === undefined || payload === null) runner[method]();
-  else if(Array.isArray(payload)) runner[method](...payload);
-  else runner[method](payload);
+  let loadingRequestCount = 0;
+  let loadingTimer = null;
+
+  function runServer(method, payload, success, options){
+    const showLoader = options && Object.prototype.hasOwnProperty.call(options, 'showLoader') ? options.showLoader : true;
+    if (showLoader) {
+      loadingRequestCount += 1;
+      if (loadingRequestCount === 1) {
+        loadingTimer = setTimeout(() => loading(true), 180);
+      }
+    }
+    const runner = google.script.run
+      .withSuccessHandler(res=>{
+        if (showLoader) {
+          loadingRequestCount = Math.max(0, loadingRequestCount - 1);
+          if (loadingRequestCount === 0) {
+            clearTimeout(loadingTimer);
+            loadingTimer = null;
+            loading(false);
+          }
+        }
+        success && success(res);
+      })
+      .withFailureHandler(err=>{
+        if (showLoader) {
+          loadingRequestCount = Math.max(0, loadingRequestCount - 1);
+          if (loadingRequestCount === 0) {
+            clearTimeout(loadingTimer);
+            loadingTimer = null;
+            loading(false);
+          }
+        }
+        alert(err.message || "Terjadi error server");
+      });
+    if(payload === undefined || payload === null) runner[method]();
+    else if(Array.isArray(payload)) runner[method](...payload);
+    else runner[method](payload);
   }
 
   // [SECURITY] Sanitasi karakter HTML untuk mencegah XSS
@@ -295,10 +318,43 @@
   let allTrx = [], curPage = 1, walBalArr = []; const rows = 10;
   let startX = 0, currentX = 0, isDragging = false, deleteIdxTemp = null;
   let searchQuery = ""; let currentUser = null; let masterData = { users: [], categories: [], wallets: [] };
+  const frontendCache = {};
+  const FRONTEND_CACHE_TTL = { master: 10000, wallets: 10000, categories: 10000, transactions: 5000, dashboard: 5000 };
+
+  function invalidateFrontendCache() {
+    Object.keys(frontendCache).forEach(key => delete frontendCache[key]);
+  }
+
+  function getCachedValue(key) {
+    const entry = frontendCache[key];
+    if (!entry) return null;
+    if (entry.expires <= Date.now()) {
+      delete frontendCache[key];
+      return null;
+    }
+    return entry.value;
+  }
+
+  function setCachedValue(key, value, ttl) {
+    frontendCache[key] = { value, expires: Date.now() + ttl };
+  }
+
+  function loadCachedServerData(cacheKey, ttl, method, payload, onSuccess, requestOptions) {
+    const cached = getCachedValue(cacheKey);
+    if (cached !== null) {
+      onSuccess && onSuccess(cached);
+      return;
+    }
+    runServer(method, payload, (res) => {
+      setCachedValue(cacheKey, res, ttl);
+      onSuccess && onSuccess(res);
+    }, requestOptions);
+  }
 
   function handleLogin() {
     const pin = document.getElementById('pinInput').value.trim();
     if (!pin) { alert('PIN wajib diisi'); return; }
+    invalidateFrontendCache();
     runServer('verifyPin', pin, (user) => {
       currentUser = user;
       document.getElementById('pinInput').value = '';
@@ -322,6 +378,7 @@
 
   function logout() {
     currentUser = null;
+    invalidateFrontendCache();
     document.getElementById('login-screen').style.display = 'block';
     document.getElementById('app-shell').style.display = 'none';
   }
@@ -335,46 +392,77 @@
     document.getElementById('current-user-label').innerText = currentUser ? currentUser.name : '-';
     document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
     loadMasterData(() => {
-      loadWallets();
       updateHDate(30);
       updateSDate(30);
-      refreshInputData();
     });
   }
 
   function loadCategoryOptions(onReady) {
     if (!currentUser) return;
-    runServer('getCategories', { userId: currentUser.id }, (cats) => {
+    loadCachedServerData(`categories:${currentUser.id}`, FRONTEND_CACHE_TTL.categories, 'getCategories', { userId: currentUser.id }, (cats) => {
       masterData.categories = Array.isArray(cats) ? cats : [];
       renderMasterData();
       toggleUI();
       if (typeof onReady === 'function') onReady(masterData.categories);
-    });
+    }, { showLoader: false });
+  }
+
+  function loadWalletData(onReady) {
+    if (!currentUser) return;
+    loadCachedServerData(`wallets:${currentUser.id}`, FRONTEND_CACHE_TTL.wallets, 'getWalletBalances', { userId: currentUser.id }, (wallets) => {
+      masterData.wallets = Array.isArray(wallets) ? wallets : [];
+      applyWalletData(masterData.wallets);
+      if (typeof onReady === 'function') onReady(masterData.wallets);
+    }, { showLoader: false });
   }
 
   function loadMasterData(onReady) {
     if (!currentUser) return;
-    runServer('getMasterData', { userId: currentUser.id }, (data) => {
-      masterData = data || { users: [], categories: [], wallets: [] };
+    const cacheKey = `master:${currentUser.id}`;
+    const cachedMaster = getCachedValue(cacheKey);
+    if (cachedMaster !== null) {
+      masterData = cachedMaster || { users: [], categories: [], wallets: [] };
       document.getElementById('current-user-label').innerText = currentUser.name;
       document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
       renderMasterData();
-      if (!Array.isArray(masterData.categories) || !masterData.categories.length) {
-        loadCategoryOptions(() => {
-          if (typeof onReady === 'function') {
-            onReady(masterData);
-          } else {
-            toggleUI();
-          }
-        });
-        return;
-      }
+      applyWalletData(masterData.wallets || []);
       if (typeof onReady === 'function') {
         onReady(masterData);
       } else {
         toggleUI();
       }
-    });
+      return;
+    }
+    runServer('getMasterData', { userId: currentUser.id }, (data) => {
+      masterData = data || { users: [], categories: [], wallets: [] };
+      setCachedValue(cacheKey, masterData, FRONTEND_CACHE_TTL.master);
+      document.getElementById('current-user-label').innerText = currentUser.name;
+      document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
+      renderMasterData();
+      const walletData = Array.isArray(masterData.wallets) ? masterData.wallets : [];
+      const categoryData = Array.isArray(masterData.categories) ? masterData.categories : [];
+      if (walletData.length) {
+        applyWalletData(walletData);
+      } else {
+        loadWalletData(() => {
+          if (categoryData.length) {
+            if (typeof onReady === 'function') onReady(masterData); else toggleUI();
+          } else {
+            loadCategoryOptions(() => {
+              if (typeof onReady === 'function') onReady(masterData); else toggleUI();
+            });
+          }
+        });
+        return;
+      }
+      if (categoryData.length) {
+        if (typeof onReady === 'function') onReady(masterData); else toggleUI();
+      } else {
+        loadCategoryOptions(() => {
+          if (typeof onReady === 'function') onReady(masterData); else toggleUI();
+        });
+      }
+    }, { showLoader: false });
   }
 
   function renderMasterData() {
@@ -386,18 +474,8 @@
 
   function refreshInputData() {
     if (!currentUser) return;
-    runServer('getMasterData', { userId: currentUser.id }, (data) => {
-      masterData = data || { users: [], categories: [], wallets: [] };
-      renderMasterData();
-      if (!Array.isArray(masterData.categories) || !masterData.categories.length) {
-        loadCategoryOptions(() => {
-          toggleUI();
-          loadWallets();
-        });
-        return;
-      }
+    loadMasterData(() => {
       toggleUI();
-      loadWallets();
     });
   }
 
@@ -409,8 +487,8 @@
     runServer('saveWallet', { name, initialBalance: initialBalance || 0, userId: currentUser.id }, () => {
       document.getElementById('walletNameInput').value = '';
       document.getElementById('walletBalanceInput').value = '';
+      invalidateFrontendCache();
       loadMasterData(() => {
-        loadWallets();
         toggleUI();
       });
       showToast();
@@ -424,6 +502,7 @@
     if (!name) { alert('Nama kategori wajib diisi'); return; }
     runServer('saveCategory', { name, type, userId: currentUser.id }, (cats) => {
       document.getElementById('categoryNameInput').value = '';
+      invalidateFrontendCache();
       masterData.categories = Array.isArray(cats) ? cats : [];
       renderMasterData();
       toggleUI();
@@ -452,6 +531,23 @@
   
   // [UI] Toggle overlay loading screen
   function loading(s) { document.getElementById('loader').style.display = s ? 'flex' : 'none'; }
+
+  function applyWalletData(wallets) {
+    walBalArr = Array.isArray(wallets) ? wallets : [];
+    const opts = walBalArr.map(w => {
+      const safe = escapeHtml(w.name);
+      return `<option value="${safe}">${safe}</option>`;
+    }).join('');
+    const walletSelect = document.getElementById('wallet');
+    const walletTargetSelect = document.getElementById('walletTujuan');
+    if (walletSelect) {
+      walletSelect.innerHTML = opts || `<option value="">Belum ada wallet</option>`;
+    }
+    if (walletTargetSelect) {
+      walletTargetSelect.innerHTML = opts || `<option value="">Belum ada wallet</option>`;
+    }
+    updateSaldoDisplay();
+  }
   
   // [UTIL] Format input angka menjadi format Rupiah
   function formatRp(e) { let v = e.value.replace(/\D/g, ""); e.value = v ? "Rp " + new Intl.NumberFormat('id-ID').format(v) : ""; }
@@ -484,13 +580,13 @@
   function resetSlide() { if (deleteIdxTemp !== null) { const card = document.getElementById(`card-${deleteIdxTemp}`); if(card){ card.style.transform = 'translateX(0)'; setTimeout(() => { const wrapper = card.parentElement; wrapper.querySelectorAll('.slide-action').forEach(el => { el.style.opacity = '0'; el.style.visibility = 'hidden'; }); }, 200); } deleteIdxTemp = null; } }
 
   // [API] Ambil riwayat transaksi terbaru dari server
-  function fetchTransactions() { if (!currentUser) return; runServer("getTransactions", { ...hF, userId: currentUser.id }, data=>{ allTrx=data; curPage=1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx();}); }
+  function fetchTransactions() { if (!currentUser) return; const cacheKey = `transactions:${currentUser.id}:${JSON.stringify(hF)}`; const cached = getCachedValue(cacheKey); if (cached !== null) { allTrx = cached; curPage = 1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx(); return; } runServer("getTransactions", { ...hF, userId: currentUser.id }, data=>{ allTrx=data; setCachedValue(cacheKey, data, FRONTEND_CACHE_TTL.transactions); curPage=1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx();}, { showLoader: false }); }
   
   // [UI] Render dashboard statistik dan chart donat
-  function fetchDashboard() { if (!currentUser) return; runServer("getDashboardData", { ...sF, userId: currentUser.id }, data=>{ document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); }); }
+  function fetchDashboard() { if (!currentUser) return; const cacheKey = `dashboard:${currentUser.id}:${JSON.stringify(sF)}`; const cached = getCachedValue(cacheKey); if (cached !== null) { const data = cached; document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); return; } runServer("getDashboardData", { ...sF, userId: currentUser.id }, data=>{ setCachedValue(cacheKey, data, FRONTEND_CACHE_TTL.dashboard); document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); }, { showLoader: false }); }
   
   // [API] Ambil daftar dompet dan saldo untuk dropdown
-  function loadWallets(){if (!currentUser) return; runServer("getWalletBalances", { userId: currentUser.id }, res=>{walBalArr=Array.isArray(res)?res:[];const opts=walBalArr.map(w=>{const safe=escapeHtml(w.name);return `<option value="${safe}">${safe}</option>`}).join('');document.getElementById('wallet').innerHTML=opts || `<option value="">Belum ada wallet</option>`;document.getElementById('walletTujuan').innerHTML=opts || `<option value="">Belum ada wallet</option>`;updateSaldoDisplay();});}
+  function loadWallets(onReady){if (!currentUser) return; loadWalletData(onReady);}
 
   // [EVENT] Handle pencarian real-time pada riwayat
   function handleSearch(val) { searchQuery = val.toLowerCase(); curPage = 1; renderTrx(); }
