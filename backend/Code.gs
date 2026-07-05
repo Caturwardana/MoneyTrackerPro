@@ -10,10 +10,16 @@ let SH_CAT;
 let APP_SETUP_RUNNING = false;
 const TZ = Session.getScriptTimeZone();
 const CACHE = CacheService.getScriptCache();
+const PROP = PropertiesService.getScriptProperties();
 const WALLET_CACHE_KEY = "wallet_balances_v2";
 const DASH_CACHE_PREFIX = "dash_cache_v2";
+const USER_CACHE_KEY = "users_cache_v2";
+const CATEGORY_CACHE_KEY = "categories_cache_v2";
+const MASTER_CACHE_PREFIX = "master_cache_v2";
+const MIGRATION_DONE_KEY = "migration_done_v2";
 const DEFAULT_USER_PIN = "1234";
 const DEFAULT_USER_NAME = "Saya";
+const CACHE_TTL_SECONDS = 600;
 
 function ensureAppSetup() {
   if (APP_SETUP_RUNNING) return;
@@ -48,7 +54,10 @@ function ensureAppSetup() {
       SH_CAT.appendRow(['Gaji', 'Pemasukan', uid]);
     }
 
-    migrateLegacyData();
+    if (!PROP.getProperty(MIGRATION_DONE_KEY)) {
+      migrateLegacyData();
+      PROP.setProperty(MIGRATION_DONE_KEY, 'true');
+    }
   } finally {
     APP_SETUP_RUNNING = false;
   }
@@ -87,16 +96,28 @@ function getUserById(userId) {
   return users.find(u => u.id === userId) || users[0] || null;
 }
 
+function getSheetValues(sheet, startRow, numCols) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= startRow - 1) return [];
+  return sheet.getRange(startRow, 1, lastRow - startRow + 1, numCols).getValues();
+}
+
 function getUsers() {
   ensureAppSetup();
-  const values = SH_USR.getRange(2, 1, Math.max(0, SH_USR.getLastRow() - 1), 5).getValues();
-  return values.filter(r => r[0]).map(r => ({
+  const cached = CACHE.get(USER_CACHE_KEY);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+  const values = getSheetValues(SH_USR, 2, 5);
+  const result = values.filter(r => r[0]).map(r => ({
     id: r[0],
     name: String(r[1] || '').trim(),
     pin: String(r[2] || '').trim(),
     createdAt: r[3],
     isAdmin: String(r[4] || '').toLowerCase() === 'true' || String(r[4] || '').toLowerCase() === '1' || (String(r[1] || '').trim() === DEFAULT_USER_NAME && String(r[2] || '').trim() === DEFAULT_USER_PIN)
   }));
+  CACHE.put(USER_CACHE_KEY, JSON.stringify(result), CACHE_TTL_SECONDS);
+  return result;
 }
 
 function verifyPin(pin) {
@@ -104,14 +125,34 @@ function verifyPin(pin) {
   const normalized = String(pin || '').trim();
   if (!normalized) throw new Error('PIN wajib diisi');
   const users = getUsers();
-  Logger.log('Verifying PIN. Input: ' + normalized + ', Users count: ' + users.length);
-  const found = users.find(u => {
-    const userPin = String(u.pin || '').trim();
-    Logger.log('Comparing PIN: "' + normalized + '" === "' + userPin + '" ? ' + (normalized === userPin));
-    return userPin === normalized;
-  });
+  const found = users.find(u => String(u.pin || '').trim() === normalized);
   if (!found) throw new Error('PIN tidak cocok');
   return { id: found.id, name: found.name, isAdmin: found.isAdmin };
+}
+
+function loginInit(pin) {
+  ensureAppSetup();
+  const normalized = String(pin || '').trim();
+  if (!normalized) throw new Error('PIN wajib diisi');
+  const users = getUsers();
+  const found = users.find(u => String(u.pin || '').trim() === normalized);
+  if (!found) throw new Error('PIN tidak cocok');
+  const uid = found.id;
+  const masterData = getMasterData(uid);
+  const start = new Date();
+  start.setDate(start.getDate() - 30);
+  const end = new Date();
+  end.setHours(23, 59, 59);
+  return {
+    user: { id: found.id, name: found.name, isAdmin: found.isAdmin },
+    users: masterData.users,
+    masterData: {
+      categories: masterData.categories,
+      wallets: masterData.wallets
+    },
+    transactions: getTransactions({ userId: uid, tipe: 'Semua', start: start.toISOString(), end: end.toISOString() }),
+    dashboard: getDashboardData({ userId: uid, tipe: 'Pengeluaran', start: start.toISOString(), end: end.toISOString() })
+  };
 }
 
 function createUser(payload) {
@@ -126,7 +167,7 @@ function createUser(payload) {
   const id = generateId();
   SH_USR.appendRow([id, name, pin, new Date(), false]);
   ensureUserSeedData(id);
-  clearDashboardCache();
+  clearAppCache(id);
   return { id, name, pin, isAdmin: false };
 }
 
@@ -141,13 +182,13 @@ function resolveUserId(userId) {
 function ensureUserSeedData(userId) {
   ensureAppSetup();
   const uid = resolveUserId(userId);
-  const walletRows = SH_WAL.getDataRange().getValues().slice(1);
+  const walletRows = getSheetValues(SH_WAL, 2, 3);
   const hasWalletForUser = walletRows.some(r => String(r[2] || '').trim() === uid && String(r[0] || '').trim());
   if (!hasWalletForUser) {
     SH_WAL.appendRow(['Cash', 0, uid]);
   }
 
-  const categoryRows = SH_CAT.getDataRange().getValues().slice(1);
+  const categoryRows = getSheetValues(SH_CAT, 2, 3);
   const hasCategoryForUser = categoryRows.some(r => String(r[2] || '').trim() === uid && String(r[0] || '').trim());
   if (!hasCategoryForUser) {
     SH_CAT.appendRow(['Makan & Minum', 'Pengeluaran', uid]);
@@ -157,7 +198,7 @@ function ensureUserSeedData(userId) {
     SH_CAT.appendRow(['Gaji', 'Pemasukan', uid]);
   }
 
-  clearDashboardCache();
+  clearAppCache(uid);
 }
 
 function migrateLegacyData() {
@@ -208,6 +249,18 @@ function clearDashboardCache() {
   CACHE.put('DASH_VER', newVersion, 600);
 }
 
+function clearAppCache(userId) {
+  CACHE.remove(USER_CACHE_KEY);
+  CACHE.remove(CATEGORY_CACHE_KEY);
+  CACHE.remove(WALLET_CACHE_KEY);
+  if (userId) {
+    CACHE.remove(MASTER_CACHE_PREFIX + '_' + userId);
+    CACHE.remove('wallets_' + userId);
+    CACHE.remove('categories_' + userId);
+  }
+  clearDashboardCache();
+}
+
 function validateTransaksi(p) {
   ensureAppSetup();
   if (!p) throw new Error('Payload kosong');
@@ -227,12 +280,19 @@ function validateTransaksi(p) {
 function getWalletBalances(userId) {
   ensureAppSetup();
   const uid = resolveUserId(userId);
+  const cacheKey = 'wallets_' + uid;
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
   ensureUserSeedData(uid);
-  const values = SH_WAL.getDataRange().getValues().slice(1);
+  const values = getSheetValues(SH_WAL, 2, 3);
   const res = values
     .filter(r => r[0] && String(r[2] || '').trim() === uid)
     .map(r => ({ name: r[0], balance: Number(r[1] || 0), userId: r[2] || uid }));
-  return res.sort((a, b) => a.name.localeCompare(b.name));
+  const sorted = res.sort((a, b) => a.name.localeCompare(b.name));
+  CACHE.put(cacheKey, JSON.stringify(sorted), CACHE_TTL_SECONDS);
+  return sorted;
 }
 
 function saveWallet(payload) {
@@ -245,7 +305,7 @@ function saveWallet(payload) {
     return getWalletBalances(uid);
   }
   SH_WAL.appendRow([name, Number(payload && payload.initialBalance ? payload.initialBalance : 0), uid]);
-  clearDashboardCache();
+  clearAppCache(uid);
   return getWalletBalances(uid);
 }
 
@@ -255,19 +315,19 @@ function updateBalance(name, amt, userId) {
   const lock = LockService.getScriptLock();
   try {
     lock.waitLock(30000);
-    const values = SH_WAL.getDataRange().getValues();
+    const values = getSheetValues(SH_WAL, 2, 3);
     let found = false;
-    for (let i = 1; i < values.length; i++) {
+    for (let i = 0; i < values.length; i++) {
       const rowUser = values[i][2] || uid;
       if (values[i][0] === name && String(rowUser) === uid) {
         const newBalance = Number(values[i][1] || 0) + amt;
-        SH_WAL.getRange(i + 1, 2).setValue(newBalance);
+        SH_WAL.getRange(i + 2, 2).setValue(newBalance);
         found = true;
         break;
       }
     }
     if (!found) throw new Error('Wallet not found: ' + name);
-    clearDashboardCache();
+    clearAppCache(uid);
     return true;
   } finally {
     try { lock.releaseLock(); } catch (e) {}
@@ -277,12 +337,19 @@ function updateBalance(name, amt, userId) {
 function getCategories(userId) {
   ensureAppSetup();
   const uid = resolveUserId(userId);
+  const cacheKey = 'categories_' + uid;
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
   ensureUserSeedData(uid);
-  const values = SH_CAT.getDataRange().getValues().slice(1);
-  return values
+  const values = getSheetValues(SH_CAT, 2, 3);
+  const result = values
     .filter(r => r[0] && String(r[2] || '').trim() === uid)
     .map(r => ({ name: r[0], type: r[1] || 'Pengeluaran' }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  CACHE.put(cacheKey, JSON.stringify(result), CACHE_TTL_SECONDS);
+  return result;
 }
 
 function saveCategory(payload) {
@@ -296,20 +363,27 @@ function saveCategory(payload) {
     return getCategories(uid);
   }
   SH_CAT.appendRow([name, type, uid]);
-  clearDashboardCache();
+  clearAppCache(uid);
   return getCategories(uid);
 }
 
 function getMasterData(userId) {
   ensureAppSetup();
   const uid = resolveUserId(userId);
+  const cacheKey = MASTER_CACHE_PREFIX + '_' + uid;
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
   ensureUserSeedData(uid);
-  return {
+  const result = {
     user: getUserById(uid),
     users: getUsers(),
     categories: getCategories(uid),
     wallets: getWalletBalances(uid)
   };
+  CACHE.put(cacheKey, JSON.stringify(result), CACHE_TTL_SECONDS);
+  return result;
 }
 
 function simpanTransaksi(p) {
@@ -337,7 +411,7 @@ function simpanTransaksi(p) {
     SH_TRX.appendRow([tgl, p.tipe, kategoriFinal, p.wallet, nominal, p.catatan, trxId, uid]);
     updateBalance(p.wallet, p.tipe === 'Pemasukan' ? nominal : -nominal, uid);
   }
-  clearDashboardCache();
+  clearAppCache(uid);
   return true;
 }
 
@@ -366,29 +440,30 @@ function hapusTransaksi(rowId, userId) {
   if (row <= 1) return false;
   const data = SH_TRX.getRange(row, 1, 1, 8).getValues()[0];
   const trxId = data[6];
-  if (trxId) deleteByTransactionId(trxId, userId || data[7]);
-  else { revertBalance(data, userId || data[7]); SH_TRX.deleteRow(row); }
-  clearDashboardCache();
+  const uid = resolveUserId(userId || data[7]);
+  if (trxId) deleteByTransactionId(trxId, uid);
+  else { revertBalance(data, uid); SH_TRX.deleteRow(row); }
+  clearAppCache(uid);
   return true;
 }
 
 function deleteByTransactionId(trxId, userId) {
   ensureAppSetup();
-  const values = SH_TRX.getDataRange().getValues();
+  const values = getSheetValues(SH_TRX, 2, 8);
   const uid = resolveUserId(userId);
-  for (let i = values.length - 1; i >= 1; i--) {
+  for (let i = values.length - 1; i >= 0; i--) {
     if (values[i][6] === trxId && String(values[i][7] || uid) === uid) {
       revertBalance(values[i], uid);
-      SH_TRX.deleteRow(i + 1);
+      SH_TRX.deleteRow(i + 2);
     }
   }
-  clearDashboardCache();
+  clearAppCache(uid);
 }
 
 function getTransactions(f) {
   ensureAppSetup();
   const uid = resolveUserId(f && f.userId ? f.userId : null);
-  const values = SH_TRX.getDataRange().getValues().slice(1);
+  const values = getSheetValues(SH_TRX, 2, 8);
   const start = new Date(f && f.start ? f.start : new Date());
   const end = new Date(f && f.end ? f.end : new Date());
   end.setHours(23, 59, 59);
@@ -423,8 +498,8 @@ function getDashboardData(f) {
   const cached = CACHE.get(cacheKey);
   if (cached) return JSON.parse(cached);
 
-  const trx = SH_TRX.getDataRange().getValues().slice(1);
-  const wal = SH_WAL.getDataRange().getValues().slice(1);
+  const trx = getSheetValues(SH_TRX, 2, 8);
+  const wal = getSheetValues(SH_WAL, 2, 3);
   const start = new Date(f && f.start ? f.start : new Date());
   const end = new Date(f && f.end ? f.end : new Date());
   end.setHours(23, 59, 59);
