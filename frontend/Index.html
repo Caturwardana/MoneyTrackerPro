@@ -102,13 +102,27 @@
   </div>
 </div>
 
-<div class="container py-2" style="max-width: 480px;">
+<div id="login-screen" class="container py-4" style="max-width: 480px;">
+  <div class="glass-card text-center">
+    <h2 class="fw-800 mb-2">Money Tracker <span style="color:#2563eb">Pro</span></h2>
+    <p class="text-muted small mb-3">Masukkan PIN untuk masuk ke akun Anda</p>
+    <div class="mb-3 text-start">
+      <label class="form-label-custom">PIN</label>
+      <input type="password" class="form-control" id="pinInput" maxlength="6" placeholder="Contoh: 1234">
+    </div>
+    <button class="btn-main" onclick="handleLogin()">MASUK</button>
+  </div>
+</div>
+
+<div id="app-shell" style="display:none;">
+  <div class="container py-2" style="max-width: 480px;">
   <div class="header-app"><h1>Money Tracker <span>Pro</span></h1></div>
 
   <ul class="nav nav-custom nav-fill" id="mainTab">
-    <li class="nav-item"><button class="nav-link active" id="tab-in-btn" data-bs-toggle="pill" data-bs-target="#tab-in" type="button">Input</button></li>
+    <li class="nav-item"><button class="nav-link active" id="tab-in-btn" data-bs-toggle="pill" data-bs-target="#tab-in" type="button" onclick="refreshInputData()">Input</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-list" type="button" onclick="fetchTransactions()">Riwayat</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-st" type="button" onclick="fetchDashboard()">Statistik</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-master" type="button" onclick="renderMasterData()">Master</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-ex" type="button">Ekspor</button></li>
   </ul>
 
@@ -192,6 +206,41 @@
       </div>
     </div>
 
+    <div class="tab-pane fade" id="tab-master" role="tabpanel">
+      <div class="glass-card">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div>
+            <div class="form-label-custom">Akun aktif</div>
+            <div id="current-user-label" class="fw-800">-</div>
+          </div>
+          <button class="btn btn-outline-dark btn-sm rounded-pill" onclick="logout()">Ganti akun</button>
+        </div>
+        <div id="admin-user-management" class="mb-3" style="display:none;">
+          <label class="form-label-custom">Tambah akun baru (Admin)</label>
+          <input type="text" class="form-control mb-2" id="newUserNameInput" placeholder="Nama akun baru">
+          <input type="password" class="form-control mb-2" id="newUserPinInput" maxlength="6" placeholder="PIN akun baru">
+          <button class="btn btn-dark w-100 rounded-4 fw-bold" onclick="handleCreateUserFromAdmin()">Tambah akun</button>
+        </div>
+        <div class="mb-3">
+          <label class="form-label-custom">Tambah Sumber Dana</label>
+          <input type="text" class="form-control mb-2" id="walletNameInput" placeholder="Contoh: Kas, Rekening, E-Wallet">
+          <input type="text" class="form-control mb-2" id="walletBalanceInput" placeholder="Saldo awal (opsional)">
+          <button class="btn btn-dark w-100 rounded-4 fw-bold" onclick="saveWalletFromForm()">Simpan Sumber Dana</button>
+        </div>
+        <div class="mb-3">
+          <label class="form-label-custom">Tambah Kategori</label>
+          <select class="form-select mb-2" id="categoryTypeInput">
+            <option value="Pengeluaran">Pengeluaran</option>
+            <option value="Pemasukan">Pemasukan</option>
+          </select>
+          <input type="text" class="form-control mb-2" id="categoryNameInput" placeholder="Contoh: Tabungan">
+          <button class="btn btn-dark w-100 rounded-4 fw-bold" onclick="saveCategoryFromForm()">Simpan Kategori</button>
+        </div>
+        <div class="small fw-800 text-muted mb-2">Daftar saat ini</div>
+        <div id="master-data-list" class="small"></div>
+      </div>
+    </div>
+
     <div class="tab-pane fade" id="tab-ex" role="tabpanel">
       <div class="glass-card">
         <label class="form-label-custom">Periode Transaksi</label>
@@ -212,8 +261,9 @@
       </div>
     </div>
 
-    <div class="footer-app"><p>&copy; 2026 Bayu Wicaksono | v4.4.0 | All Rights Reserved.</p></div>
+    <div class="footer-app"><p>&copy; 2026 Catur | v1 | All Rights Reserved.</p></div>
   </div>
+</div>
 </div>
 
 <script>
@@ -230,6 +280,7 @@
       alert(err.message || "Terjadi error server");
     });
   if(payload === undefined || payload === null) runner[method]();
+  else if(Array.isArray(payload)) runner[method](...payload);
   else runner[method](payload);
   }
 
@@ -243,7 +294,142 @@
   let hF = { tipe: 'Semua', start: '', end: '' }, sF = { tipe: 'Pengeluaran', start: '', end: '' }, chartObj = null;
   let allTrx = [], curPage = 1, walBalArr = []; const rows = 10;
   let startX = 0, currentX = 0, isDragging = false, deleteIdxTemp = null;
-  let searchQuery = ""; 
+  let searchQuery = ""; let currentUser = null; let masterData = { users: [], categories: [], wallets: [] };
+
+  function handleLogin() {
+    const pin = document.getElementById('pinInput').value.trim();
+    if (!pin) { alert('PIN wajib diisi'); return; }
+    runServer('verifyPin', pin, (user) => {
+      currentUser = user;
+      document.getElementById('pinInput').value = '';
+      showAppShell();
+      initializeAfterLogin();
+    });
+  }
+
+  function handleCreateUserFromAdmin() {
+    if (!currentUser || !currentUser.isAdmin) { alert('Hanya akun admin yang bisa menambah akun'); return; }
+    const name = document.getElementById('newUserNameInput').value.trim();
+    const pin = document.getElementById('newUserPinInput').value.trim();
+    if (!name || !pin) { alert('Isi nama akun dan PIN'); return; }
+    runServer('createUser', { name, pin, userId: currentUser.id }, () => {
+      document.getElementById('newUserNameInput').value = '';
+      document.getElementById('newUserPinInput').value = '';
+      loadMasterData();
+      showToast();
+    });
+  }
+
+  function logout() {
+    currentUser = null;
+    document.getElementById('login-screen').style.display = 'block';
+    document.getElementById('app-shell').style.display = 'none';
+  }
+
+  function showAppShell() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-shell').style.display = 'block';
+  }
+
+  function initializeAfterLogin() {
+    document.getElementById('current-user-label').innerText = currentUser ? currentUser.name : '-';
+    document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
+    loadMasterData(() => {
+      loadWallets();
+      updateHDate(30);
+      updateSDate(30);
+      refreshInputData();
+    });
+  }
+
+  function loadCategoryOptions(onReady) {
+    if (!currentUser) return;
+    runServer('getCategories', { userId: currentUser.id }, (cats) => {
+      masterData.categories = Array.isArray(cats) ? cats : [];
+      renderMasterData();
+      toggleUI();
+      if (typeof onReady === 'function') onReady(masterData.categories);
+    });
+  }
+
+  function loadMasterData(onReady) {
+    if (!currentUser) return;
+    runServer('getMasterData', { userId: currentUser.id }, (data) => {
+      masterData = data || { users: [], categories: [], wallets: [] };
+      document.getElementById('current-user-label').innerText = currentUser.name;
+      document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
+      renderMasterData();
+      if (!Array.isArray(masterData.categories) || !masterData.categories.length) {
+        loadCategoryOptions(() => {
+          if (typeof onReady === 'function') {
+            onReady(masterData);
+          } else {
+            toggleUI();
+          }
+        });
+        return;
+      }
+      if (typeof onReady === 'function') {
+        onReady(masterData);
+      } else {
+        toggleUI();
+      }
+    });
+  }
+
+  function renderMasterData() {
+    const list = document.getElementById('master-data-list');
+    const wallets = (masterData.wallets || []).map(w => `<div class="d-flex justify-content-between py-1"><span>${escapeHtml(w.name)}</span><span class="fw-bold">Rp ${Number(w.balance || 0).toLocaleString('id-ID')}</span></div>`).join('');
+    const cats = (masterData.categories || []).map(c => `<div class="d-flex justify-content-between py-1"><span>${escapeHtml(c.name)}</span><span class="text-muted">${escapeHtml(c.type)}</span></div>`).join('');
+    list.innerHTML = `<div class="mb-3"><div class="small fw-800 text-muted mb-2">Sumber Dana</div>${wallets || '<div class="small text-muted">Belum ada sumber dana</div>'}</div><div><div class="small fw-800 text-muted mb-2">Kategori</div>${cats || '<div class="small text-muted">Belum ada kategori</div>'}</div>`;
+  }
+
+  function refreshInputData() {
+    if (!currentUser) return;
+    runServer('getMasterData', { userId: currentUser.id }, (data) => {
+      masterData = data || { users: [], categories: [], wallets: [] };
+      renderMasterData();
+      if (!Array.isArray(masterData.categories) || !masterData.categories.length) {
+        loadCategoryOptions(() => {
+          toggleUI();
+          loadWallets();
+        });
+        return;
+      }
+      toggleUI();
+      loadWallets();
+    });
+  }
+
+  function saveWalletFromForm() {
+    if (!currentUser) return;
+    const name = document.getElementById('walletNameInput').value.trim();
+    const initialBalance = document.getElementById('walletBalanceInput').value.replace(/[^0-9]/g, '');
+    if (!name) { alert('Nama sumber dana wajib diisi'); return; }
+    runServer('saveWallet', { name, initialBalance: initialBalance || 0, userId: currentUser.id }, () => {
+      document.getElementById('walletNameInput').value = '';
+      document.getElementById('walletBalanceInput').value = '';
+      loadMasterData(() => {
+        loadWallets();
+        toggleUI();
+      });
+      showToast();
+    });
+  }
+
+  function saveCategoryFromForm() {
+    if (!currentUser) return;
+    const name = document.getElementById('categoryNameInput').value.trim();
+    const type = document.getElementById('categoryTypeInput').value;
+    if (!name) { alert('Nama kategori wajib diisi'); return; }
+    runServer('saveCategory', { name, type, userId: currentUser.id }, (cats) => {
+      document.getElementById('categoryNameInput').value = '';
+      masterData.categories = Array.isArray(cats) ? cats : [];
+      renderMasterData();
+      toggleUI();
+      showToast();
+    });
+  }
 
   // [CONFIG] Map kategori, warna, dan icon
   const CAT_MAP = { 
@@ -292,19 +478,19 @@
   function handleDelete(idx) { deleteIdxTemp = idx; const modal = new bootstrap.Modal(document.getElementById('modalConfirm')); modal.show(); }
   
   // [API] Eksekusi penghapusan transaksi ke server
-  function executeDelete() { if (deleteIdxTemp === null) return; const t = allTrx[deleteIdxTemp]; const modal = bootstrap.Modal.getInstance(document.getElementById('modalConfirm')); modal.hide(); runServer("hapusTransaksi", t.row, ()=>{ fetchTransactions(); loadWallets(); deleteIdxTemp = null; showToast(); }); }
+  function executeDelete() { if (deleteIdxTemp === null) return; const t = allTrx[deleteIdxTemp]; const modal = bootstrap.Modal.getInstance(document.getElementById('modalConfirm')); modal.hide(); runServer("hapusTransaksi", [t.row, currentUser ? currentUser.id : null], ()=>{ fetchTransactions(); loadWallets(); deleteIdxTemp = null; showToast(); }); }
   
   // [UX] Kembalikan posisi baris jika aksi dibatalkan
   function resetSlide() { if (deleteIdxTemp !== null) { const card = document.getElementById(`card-${deleteIdxTemp}`); if(card){ card.style.transform = 'translateX(0)'; setTimeout(() => { const wrapper = card.parentElement; wrapper.querySelectorAll('.slide-action').forEach(el => { el.style.opacity = '0'; el.style.visibility = 'hidden'; }); }, 200); } deleteIdxTemp = null; } }
 
   // [API] Ambil riwayat transaksi terbaru dari server
-  function fetchTransactions() { runServer("getTransactions", hF, data=>{ allTrx=data; curPage=1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx();}); }
+  function fetchTransactions() { if (!currentUser) return; runServer("getTransactions", { ...hF, userId: currentUser.id }, data=>{ allTrx=data; curPage=1; document.getElementById('searchInput').value = ''; searchQuery = ''; renderTrx();}); }
   
   // [UI] Render dashboard statistik dan chart donat
-  function fetchDashboard() { runServer("getDashboardData", sF, data=>{ document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); }); }
+  function fetchDashboard() { if (!currentUser) return; runServer("getDashboardData", { ...sF, userId: currentUser.id }, data=>{ document.getElementById('total-semua-saldo').innerText = "Rp " + data.totalSemua.toLocaleString('id-ID'); document.getElementById('wallet-list').innerHTML = data.walletDetails.map(w => `<div class="d-flex justify-content-between py-2 small fw-bold border-bottom"><span>${escapeHtml(w.name)}</span><span>Rp ${w.balance.toLocaleString('id-ID')}</span></div>`).join(''); const sortK = Object.keys(data.catStats).sort((a, b) => data.catStats[b] - data.catStats[a]); const val = sortK.map(l => data.catStats[l]), col = sortK.map(l => getDynamicColor(l)), tot = data.totalFiltered; if (chartObj) chartObj.destroy(); chartObj = new Chart(document.getElementById('myChart'), { type: 'doughnut', data: { labels: sortK, datasets: [{ data: val, backgroundColor: col, borderWidth: 0 }] }, options: { cutout: '82%', plugins: { legend: { display: false } }, maintainAspectRatio: false }, plugins: [{ beforeDraw: (c) => { const { ctx, width, height } = c; ctx.restore(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 1.1rem Plus Jakarta Sans'; ctx.fillStyle = '#1e293b'; ctx.fillText('Rp ' + tot.toLocaleString('id-ID'), width / 2, height / 2); ctx.save(); } }] }); document.getElementById('cat-list').innerHTML = sortK.map((l, i) => { const p = tot > 0 ? ((val[i] / tot) * 100).toFixed(0) : 0; return `<div class="cat-item"><div class="cat-icon-box" style="background:${col[i]}15; color:${col[i]}">${getDynamicIcon(l)}</div><div class="flex-grow-1"><div class="d-flex justify-content-between"><span class="small fw-bold">${escapeHtml(l)}</span><span class="small fw-bold">Rp ${val[i].toLocaleString('id-ID')}</span></div><div class="progress-wrap"><div class="progress-bar-fill" style="width:${p}%; background:${col[i]}"></div></div></div><div class="ms-3 fw-800 small" style="color:${col[i]}">${p}%</div></div>`; }).join(''); }); }
   
   // [API] Ambil daftar dompet dan saldo untuk dropdown
-  function loadWallets(){runServer("getWalletBalances",null,res=>{walBalArr=res;const opts=res.map(w=>{const safe=escapeHtml(w.name);return `<option value="${safe}">${safe}</option>`}).join('');document.getElementById('wallet').innerHTML=opts;document.getElementById('walletTujuan').innerHTML=opts;updateSaldoDisplay();});}
+  function loadWallets(){if (!currentUser) return; runServer("getWalletBalances", { userId: currentUser.id }, res=>{walBalArr=Array.isArray(res)?res:[];const opts=walBalArr.map(w=>{const safe=escapeHtml(w.name);return `<option value="${safe}">${safe}</option>`}).join('');document.getElementById('wallet').innerHTML=opts || `<option value="">Belum ada wallet</option>`;document.getElementById('walletTujuan').innerHTML=opts || `<option value="">Belum ada wallet</option>`;updateSaldoDisplay();});}
 
   // [EVENT] Handle pencarian real-time pada riwayat
   function handleSearch(val) { searchQuery = val.toLowerCase(); curPage = 1; renderTrx(); }
@@ -328,10 +514,37 @@
   }
 
   // [EVENT] Handle submit form transaksi (Simpan/Update)
-  function handleSave(e) { e.preventDefault(); if (document.getElementById('kategori').value === 'Lainnya' && !document.getElementById('kategoriKustom').value.trim()) { alert("Isi kategori!"); return; } const p = { tipe: document.getElementById('tipe').value, kategori: document.getElementById('kategori').value, kategoriKustom: document.getElementById('kategoriKustom').value, wallet: document.getElementById('wallet').value, walletTujuan: document.getElementById('walletTujuan').value, jumlah: document.getElementById('jumlah').value.replace(/[^0-9]/g, ""), catatan: document.getElementById('catatan').value, tgl: document.getElementById('tglInput').value, rowId: document.getElementById('editRowId').value, trxId: document.getElementById('editRowId').dataset.trxid || "" }; runServer("simpanTransaksi", p, ()=>{ document.getElementById('mainForm').reset(); document.getElementById('editRowId').value = ""; document.getElementById('editRowId').dataset.trxid = ""; document.getElementById('btn-submit').innerText = "SIMPAN TRANSAKSI"; setDefaultDate(); toggleUI(); loadWallets(); fetchTransactions(); showToast(); }); }
+  function handleSave(e) { e.preventDefault(); if (!currentUser) { alert('Silakan masuk dulu'); return; } if (document.getElementById('kategori').value === 'Lainnya' && !document.getElementById('kategoriKustom').value.trim()) { alert("Isi kategori!"); return; } const p = { tipe: document.getElementById('tipe').value, kategori: document.getElementById('kategori').value, kategoriKustom: document.getElementById('kategoriKustom').value, wallet: document.getElementById('wallet').value, walletTujuan: document.getElementById('walletTujuan').value, jumlah: document.getElementById('jumlah').value.replace(/[^0-9]/g, ""), catatan: document.getElementById('catatan').value, tgl: document.getElementById('tglInput').value, rowId: document.getElementById('editRowId').value, trxId: document.getElementById('editRowId').dataset.trxid || "", userId: currentUser.id }; runServer("simpanTransaksi", p, ()=>{ document.getElementById('mainForm').reset(); document.getElementById('editRowId').value = ""; document.getElementById('editRowId').dataset.trxid = ""; document.getElementById('btn-submit').innerText = "SIMPAN TRANSAKSI"; setDefaultDate(); toggleUI(); loadWallets(); fetchTransactions(); fetchDashboard(); showToast(); }); }
   
   // [UI] Sesuaikan input kategori berdasarkan tipe transaksi
-  function toggleUI() { const t = document.getElementById('tipe').value; document.getElementById('kat-area').style.display = t === 'Transfer' ? 'none' : 'block'; document.getElementById('tujuan-area').style.display = t === 'Transfer' ? 'block' : 'none'; const cats = (t === 'Pemasukan') ? ["Gaji", "Bisnis", "Investasi", "Hadiah", "Fintech", "Lainnya"] : ["Makan & Minum", "Transportasi", "Belanja", "Tempat Tinggal", "Keluarga", "Hiburan", "Fintech", "Kesehatan", "Teman", "Hewan Peliharaan", "Keuangan", "Pribadi", "Sistem", "Lainnya"]; document.getElementById('kategori').innerHTML = cats.map(k => `<option value="${k}">${k}</option>`).join(''); checkLainnya(); }
+  function toggleUI() {
+    const t = document.getElementById('tipe').value;
+    document.getElementById('kat-area').style.display = t === 'Transfer' ? 'none' : 'block';
+    document.getElementById('tujuan-area').style.display = t === 'Transfer' ? 'block' : 'none';
+    const select = document.getElementById('kategori');
+    if (!select) return;
+
+    if (!Array.isArray(masterData.categories) || !masterData.categories.length) {
+      if (currentUser) {
+        runServer('getCategories', { userId: currentUser.id }, (cats) => {
+          masterData.categories = Array.isArray(cats) ? cats : [];
+          toggleUI();
+        });
+      }
+      select.innerHTML = '<option value="Lainnya">Lainnya</option>';
+      checkLainnya();
+      return;
+    }
+
+    const userCats = (masterData.categories || [])
+      .filter(c => c.type === (t === 'Transfer' ? 'Pengeluaran' : t))
+      .map(c => c.name);
+    const options = Array.from(new Set([...userCats, 'Lainnya'])).filter(Boolean);
+    select.innerHTML = options.length
+      ? options.map(k => `<option value="${k}">${escapeHtml(k)}</option>`).join('')
+      : `<option value="Lainnya">Lainnya</option>`;
+    checkLainnya();
+  }
   
   // [UI] Tampilkan input teks jika memilih kategori 'Lainnya'
   function checkLainnya() { document.getElementById('kat-kustom-area').style.display = document.getElementById('kategori').value === 'Lainnya' ? 'block' : 'none'; }
@@ -358,13 +571,13 @@
   function setDefaultDate() { const now = new Date(); now.setMinutes(now.getMinutes() - now.getTimezoneOffset()); document.getElementById('tglInput').value = now.toISOString().slice(0, 16); }
   
   // [API] Ambil pratinjau data untuk kebutuhan ekspor
-  function processExport(){const s=document.getElementById('ex-start').value,e=document.getElementById('ex-end').value;if(!s||!e){alert("Pilih tanggal!");return;}runServer("getExportData",[s,e],data=>{document.getElementById('export-preview-area').style.setProperty('display','block','important');document.getElementById('export-body').innerHTML=data.map(r=>`<tr><td>${r.kode}</td><td>${r.tgl}</td><td>${escapeHtml(r.wallet)}</td><td>${escapeHtml(r.keterangan)}</td><td>${escapeHtml(r.catatan)}</td><td class="text-success">${r.debit?'Rp '+r.debit.toLocaleString('id-ID'):'-'}</td><td class="text-danger">${r.kredit?'Rp '+r.kredit.toLocaleString('id-ID'):'-'}</td><td>Rp ${r.total.toLocaleString('id-ID')}</td></tr>`).join('');});}
+  function processExport(){const s=document.getElementById('ex-start').value,e=document.getElementById('ex-end').value;if(!s||!e){alert("Pilih tanggal!");return;}runServer("getExportData",{ start:s, end:e, userId: currentUser ? currentUser.id : null },data=>{document.getElementById('export-preview-area').style.setProperty('display','block','important');document.getElementById('export-body').innerHTML=data.map(r=>`<tr><td>${r.kode}</td><td>${r.tgl}</td><td>${escapeHtml(r.wallet)}</td><td>${escapeHtml(r.keterangan)}</td><td>${escapeHtml(r.catatan)}</td><td class="text-success">${r.debit?'Rp '+r.debit.toLocaleString('id-ID'):'-'}</td><td class="text-danger">${r.kredit?'Rp '+r.kredit.toLocaleString('id-ID'):'-'}</td><td>Rp ${r.total.toLocaleString('id-ID')}</td></tr>`).join('');});}
   
   // [UTIL] Generate dan download file CSV dari tabel pratinjau
   function downloadCSV() { const table = document.getElementById("table-export"); let csv = []; for (let i = 0; i < table.rows.length; i++) { let row = [], cols = table.rows[i].querySelectorAll("td, th"); for (let j = 0; j < cols.length; j++) row.push('"' + cols[j].innerText.replace(/Rp\s?|(?<=\d)\.(?=\d{3})/g, '').replace(/\n/g, ' ') + '"'); csv.push(row.join(",")); } const blob = new Blob(["\uFEFF" + csv.join("\n")], { type: "text/csv;charset=utf-8;" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Export_${new Date().getTime()}.csv`; document.body.appendChild(link); link.click(); document.body.removeChild(link); }
 
   // [INIT] Jalankan fungsi inisialisasi saat window dimuat
-  window.onload = () => { setDefaultDate(); loadWallets(); updateHDate(30); updateSDate(30); toggleUI(); };
+  window.onload = () => { setDefaultDate(); document.getElementById('current-user-label').innerText = '-'; };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
