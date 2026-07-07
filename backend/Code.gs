@@ -16,7 +16,7 @@ const MASTER_CACHE_PREFIX = "master_cache_v2";
 const MIGRATION_DONE_KEY = "migration_done_v2";
 const DEFAULT_USER_PIN = "1234";
 const DEFAULT_USER_NAME = "Saya";
-const CACHE_TTL_SECONDS = 600;
+const CACHE_TTL_SECONDS = 120;
 
 function ensureAppSetup() {
   if (APP_SETUP_RUNNING) return;
@@ -85,6 +85,10 @@ function ensureHeaders(sheet, headers) {
   if (!hasHeaders) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   }
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
 function doGet() {
@@ -379,6 +383,88 @@ function saveCategory(payload) {
   return getCategories(uid);
 }
 
+function editWallet(payload) {
+  ensureAppSetup();
+  const uid = resolveUserId(payload && payload.userId ? payload.userId : null);
+  const oldName = String(payload && payload.oldName ? payload.oldName : '').trim();
+  const newName = String(payload && payload.newName ? payload.newName : '').trim();
+  if (!oldName || !newName) throw new Error('Nama lama dan baru wajib diisi');
+  const values = getSheetValues(SH_WAL, 2, 3);
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === oldName && String(values[i][2] || '').trim() === uid) {
+      SH_WAL.getRange(i + 2, 1).setValue(newName);
+      // Cascade-update existing transaksi records
+      const trxValues = getSheetValues(SH_TRX, 2, 8);
+      for (let j = 0; j < trxValues.length; j++) {
+        if (trxValues[j][3] === oldName && String(trxValues[j][7] || '').trim() === uid) {
+          SH_TRX.getRange(j + 2, 4).setValue(newName);
+        }
+      }
+      clearAppCache(uid);
+      return getWalletBalances(uid);
+    }
+  }
+  throw new Error('Wallet tidak ditemukan: ' + oldName);
+}
+
+function deleteWallet(payload) {
+  ensureAppSetup();
+  const uid = resolveUserId(payload && payload.userId ? payload.userId : null);
+  const name = String(payload && payload.name ? payload.name : '').trim();
+  if (!name) throw new Error('Nama wallet wajib diisi');
+  const values = getSheetValues(SH_WAL, 2, 3);
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === name && String(values[i][2] || '').trim() === uid) {
+      SH_WAL.deleteRow(i + 2);
+      clearAppCache(uid);
+      return getWalletBalances(uid);
+    }
+  }
+  throw new Error('Wallet tidak ditemukan: ' + name);
+}
+
+function editCategory(payload) {
+  ensureAppSetup();
+  const uid = resolveUserId(payload && payload.userId ? payload.userId : null);
+  const oldName = String(payload && payload.oldName ? payload.oldName : '').trim();
+  const newName = String(payload && payload.newName ? payload.newName : '').trim();
+  const type = String(payload && payload.type ? payload.type : 'Pengeluaran').trim();
+  if (!oldName || !newName) throw new Error('Nama lama dan baru wajib diisi');
+  const values = getSheetValues(SH_CAT, 2, 3);
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === oldName && String(values[i][2] || '').trim() === uid) {
+      SH_CAT.getRange(i + 2, 1).setValue(newName);
+      SH_CAT.getRange(i + 2, 2).setValue(type);
+      // Cascade-update existing transaksi records
+      const trxValues = getSheetValues(SH_TRX, 2, 8);
+      for (let j = 0; j < trxValues.length; j++) {
+        if (trxValues[j][2] === oldName && String(trxValues[j][7] || '').trim() === uid) {
+          SH_TRX.getRange(j + 2, 3).setValue(newName);
+        }
+      }
+      clearAppCache(uid);
+      return getCategories(uid);
+    }
+  }
+  throw new Error('Kategori tidak ditemukan: ' + oldName);
+}
+
+function deleteCategory(payload) {
+  ensureAppSetup();
+  const uid = resolveUserId(payload && payload.userId ? payload.userId : null);
+  const name = String(payload && payload.name ? payload.name : '').trim();
+  if (!name) throw new Error('Nama kategori wajib diisi');
+  const values = getSheetValues(SH_CAT, 2, 3);
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === name && String(values[i][2] || '').trim() === uid) {
+      SH_CAT.deleteRow(i + 2);
+      clearAppCache(uid);
+      return getCategories(uid);
+    }
+  }
+  throw new Error('Kategori tidak ditemukan: ' + name);
+}
+
 function getMasterData(userId) {
   ensureAppSetup();
   const uid = resolveUserId(userId);
@@ -388,11 +474,22 @@ function getMasterData(userId) {
     try { return JSON.parse(cached); } catch (e) {}
   }
   ensureUserSeedData(uid);
+  // Batch-read all sheets in one go to avoid N+1
+  const catValues = getSheetValues(SH_CAT, 2, 3);
+  const walValues = getSheetValues(SH_WAL, 2, 3);
+  const categories = catValues
+    .filter(r => r[0] && String(r[2] || '').trim() === uid)
+    .map(r => ({ name: r[0], type: r[1] || 'Pengeluaran' }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const wallets = walValues
+    .filter(r => r[0] && String(r[2] || '').trim() === uid)
+    .map(r => ({ name: r[0], balance: Number(r[1] || 0), userId: r[2] || uid }))
+    .sort((a, b) => a.name.localeCompare(b.name));
   const result = {
     user: getUserById(uid),
     users: getUsers(),
-    categories: getCategories(uid),
-    wallets: getWalletBalances(uid)
+    categories: categories,
+    wallets: wallets
   };
   CACHE.put(cacheKey, JSON.stringify(result), CACHE_TTL_SECONDS);
   return result;
@@ -487,7 +584,6 @@ function getTransactions(f) {
     const matchTipe = f && f.tipe === 'Semua' ? true : r[1] === f.tipe || (f.tipe === 'Pemasukan' && r[1] === 'Transfer In') || (f.tipe === 'Pengeluaran' && r[1] === 'Transfer Out');
     if (d >= start && d <= end && matchTipe) {
       result.push({
-        // Use plain Date methods to avoid heavy Utilities.formatDate calls inside loops
         tgl: (function(dt){ const d=new Date(dt); const dd=('0'+d.getDate()).slice(-2); const mm=('0'+(d.getMonth()+1)).slice(-2); return dd + '/' + mm; })(r[0]),
         tglRaw: (function(dt){ const d=new Date(dt); const yyyy=d.getFullYear(); const mm=('0'+(d.getMonth()+1)).slice(-2); const dd=('0'+d.getDate()).slice(-2); const hh=('0'+d.getHours()).slice(-2); const min=('0'+d.getMinutes()).slice(-2); return `${yyyy}-${mm}-${dd}T${hh}:${min}`; })(r[0]),
         tipe: r[1],
@@ -500,7 +596,14 @@ function getTransactions(f) {
       });
     }
   });
-  return result.sort((a, b) => new Date(b.tglRaw) - new Date(a.tglRaw));
+  const sorted = result.sort((a, b) => new Date(b.tglRaw) - new Date(a.tglRaw));
+  const page = Number(f && f.page ? f.page : 0);
+  const limit = Number(f && f.limit ? f.limit : 0);
+  if (page > 0 && limit > 0) {
+    const startIdx = (page - 1) * limit;
+    return { data: sorted.slice(startIdx, startIdx + limit), total: sorted.length, page, limit };
+  }
+  return sorted;
 }
 
 function getDashboardData(f) {
@@ -585,6 +688,29 @@ function getExportData(params) {
     }
   });
   return exportData;
+}
+
+function getMonthlyRecap(f) {
+  ensureAppSetup();
+  const uid = resolveUserId(f && f.userId ? f.userId : null);
+  const year = Number(f && f.year ? f.year : new Date().getFullYear());
+  const trx = getSheetValues(SH_TRX, 2, 8);
+  const months = [];
+  for (let m = 0; m < 12; m++) {
+    let income = 0, expense = 0, count = 0;
+    trx.forEach(r => {
+      if (String(r[7] || '').trim() !== uid || !r[0]) return;
+      const d = new Date(r[0]);
+      if (d.getFullYear() === year && d.getMonth() === m) {
+        const tipe = r[1];
+        const nominal = Number(r[4] || 0);
+        if (tipe === 'Pemasukan' || tipe === 'Transfer In') { income += nominal; } else if (tipe === 'Pengeluaran' || tipe === 'Transfer Out') { expense += nominal; }
+        count++;
+      }
+    });
+    months.push({ month: m + 1, income, expense, count });
+  }
+  return { year, months };
 }
 
 function escapeCsvField(str) {
