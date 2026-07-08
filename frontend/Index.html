@@ -787,10 +787,12 @@
       const reqYear = recapYear;
       document.getElementById('recapYear').textContent = reqYear;
       document.getElementById('recap-loader').style.display = 'block';
+      console.log('Rekap auto-refresh: request tahun', reqYear);
       runServer('getMonthlyRecap', { year: reqYear, userId: currentUser.id }, (data) => {
-        if (!data || data.year != recapYear) { document.getElementById('recap-loader').style.display = 'none'; return; }
-        recapData = data;
         document.getElementById('recap-loader').style.display = 'none';
+        console.log('Rekap auto-refresh: response tahun', data ? data.year : null, '| recapYear skrg', recapYear);
+        if (!data || data.year != recapYear) { console.log('Rekap auto-refresh: response ditolak'); return; }
+        recapData = data;
         renderRecap();
       }, { showLoader: false, onError: () => { document.getElementById('recap-loader').style.display = 'none'; } });
     }
@@ -799,29 +801,40 @@
       if (!currentUser) return;
       recapYear += delta;
       document.getElementById('recapYear').textContent = recapYear;
-      document.getElementById('recapContent').innerHTML = '';
       document.getElementById('recap-loader').style.display = 'block';
+      console.log('Rekap: request tahun', recapYear);
+      // Gunakan setTimeout untuk hindari race condition google.script.run singleton
+      setTimeout(() => {
       runServer('getMonthlyRecap', { year: recapYear, userId: currentUser.id }, (data) => {
-        if (!data || data.year != recapYear) { document.getElementById('recap-loader').style.display = 'none'; return; }
-        recapData = data;
         document.getElementById('recap-loader').style.display = 'none';
+        const dataType = data === null ? 'null' : (data === undefined ? 'undefined' : typeof data);
+        console.log('Rekap: response tipe=' + dataType + ' tahun=' + (data ? data.year : null) + ' | recapYear skrg', recapYear, '| months length', data && data.months ? data.months.length : 0, '| error', data && data.error ? data.error : null, '| step', data && data.step ? data.step : null);
+        if (!data || data.year != recapYear || data.error) { console.log('Rekap: response ditolak', data && data.error ? 'server error: ' + data.error + ' (step: ' + data.step + ')' : '(stale/null)'); return; }
+        recapData = data;
         renderRecap();
-      }, { showLoader: false, onError: () => { document.getElementById('recap-loader').style.display = 'none'; } });
+      }, { showLoader: false, onError: (err) => { document.getElementById('recap-loader').style.display = 'none'; console.log('Rekap: server error', err); } });
+      }, 0);
     }
 
     function renderRecap() {
-      if (!recapData || !recapData.months) return;
+      try {
+      console.log('Rekap: renderRecap dipanggil, tahun =', recapData ? recapData.year : null, 'totalCount =', recapData && recapData.months ? recapData.months.reduce((s,m) => s+m.count, 0) : 0);
+      if (!recapData || !recapData.months) { console.log('Rekap: renderRecap skipped - no data'); return; }
       const months = recapData.months;
       const year = recapData.year;
-      let totalIncome = 0, totalExpense = 0, totalCount = 0;
-      const bars = months.map(m => {
+      let totalIncome = 0, totalExpense = 0, totalCount = 0, yearMax = 0;
+      months.forEach(m => {
         totalIncome += m.income;
         totalExpense += m.expense;
         totalCount += m.count;
-        const maxVal = Math.max(m.income, m.expense, 1);
-        const hInc = Math.round((m.income / maxVal) * 100);
-        const hExp = Math.round((m.expense / maxVal) * 100);
-        const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+        const mx = Math.max(m.income, m.expense);
+        if (mx > yearMax) yearMax = mx;
+      });
+      const scale = Math.max(yearMax, 1);
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+      const bars = months.map(m => {
+        const hInc = Math.round((m.income / scale) * 100);
+        const hExp = Math.round((m.expense / scale) * 100);
         return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px;flex:1;min-width:0;">
         <div style="display:flex;flex-direction:column;align-items:center;height:100px;justify-content:flex-end;gap:2px;">
           <div style="width:16px;height:${hInc}%;background:#10b981;border-radius:4px 4px 0 0;transition:height 0.3s;" title="Pemasukan: Rp ${m.income.toLocaleString('id-ID')}"></div>
@@ -849,7 +862,7 @@
       </div>
       <div style="display:flex;gap:4px;padding:10px 0;overflow-x:auto;">${bars}</div>
     `;
-    }
+    } catch(e) { console.log('Rekap: renderRecap error', e); } }
 
     // [UX] Gesture: Inisialisasi swipe pada baris transaksi
     function ts(e, i) { startX = e.touches[0].clientX; isDragging = true; const wrapper = document.getElementById(`card-${i}`).parentElement; wrapper.querySelectorAll('.slide-action').forEach(el => { el.style.visibility = 'visible'; el.style.opacity = '1'; }); }
@@ -1122,11 +1135,14 @@
       localStorage.setItem('theme', isDark ? 'light' : 'dark');
     }
     (function initTheme() {
-      const saved = localStorage.getItem('theme');
-      if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-        document.documentElement.setAttribute('data-theme', 'dark');
-        document.getElementById('themeToggle').innerText = '☀️';
-      }
+      try {
+        const saved = localStorage.getItem('theme');
+        if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+          const btn = document.getElementById('themeToggle');
+          if (btn) btn.innerText = '☀️';
+        }
+      } catch(e) {}
     })();
     (function init() {
       try { setDefaultDate(); } catch (e) {}

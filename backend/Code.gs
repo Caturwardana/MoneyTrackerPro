@@ -732,26 +732,39 @@ function getExportData(params) {
 }
 
 function getMonthlyRecap(f) {
-  ensureAppSetup();
-  const uid = resolveUserId(f && f.userId ? f.userId : null);
-  const year = Number(f && f.year ? f.year : new Date().getFullYear());
-  const trx = getSheetValues(SH_TRX, 2, 8);
-  const months = [];
-  for (let m = 0; m < 12; m++) {
-    let income = 0, expense = 0, count = 0;
-    trx.forEach(r => {
-      if (String(r[7] || '').trim() !== uid || !r[0]) return;
-      const d = new Date(r[0]);
-      if (d.getFullYear() === year && d.getMonth() === m) {
-        const tipe = r[1];
-        const nominal = Number(r[4] || 0);
-        if (tipe === 'Pemasukan' || tipe === 'Transfer In') { income += nominal; } else if (tipe === 'Pengeluaran' || tipe === 'Transfer Out') { expense += nominal; }
-        count++;
+  try {
+    const step1 = 'ensureAppSetup';
+    ensureAppSetup();
+    const step2 = 'resolveUserId';
+    const uid = resolveUserId(f && f.userId ? f.userId : null);
+    const step3 = 'parseYear';
+    const year = Number(f && f.year ? f.year : new Date().getFullYear());
+    const step4 = 'getSheetValues';
+    const trx = getSheetValues(SH_TRX, 2, 8);
+    if (!trx) return { error: 'getSheetValues returned null', step: step4, year: year };
+    const step5 = 'processMonths';
+    const months = [];
+    for (let m = 0; m < 12; m++) {
+      let income = 0, expense = 0, count = 0;
+      for (let ri = 0; ri < trx.length; ri++) {
+        const r = trx[ri];
+        if (String(r[7] || '').trim() !== uid || !r[0]) continue;
+        const d = new Date(r[0]);
+        if (isNaN(d.getTime())) continue;
+        if (d.getFullYear() === year && d.getMonth() === m) {
+          const tipe = String(r[1] || '');
+          const nominal = Number(r[4] || 0);
+          if (isNaN(nominal)) continue;
+          if (tipe === 'Pemasukan' || tipe === 'Transfer In') { income += nominal; } else if (tipe === 'Pengeluaran' || tipe === 'Transfer Out') { expense += nominal; }
+          count++;
+        }
       }
-    });
-    months.push({ month: m + 1, income, expense, count });
+      months.push({ month: m + 1, income: isNaN(income) ? 0 : income, expense: isNaN(expense) ? 0 : expense, count: count });
+    }
+    return { year, months };
+  } catch(e) {
+    return { error: String(e), step: step1 || 'unknown', year: f && f.year ? Number(f.year) : 0 };
   }
-  return { year, months };
 }
 
 function escapeCsvField(str) {
