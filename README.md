@@ -15,22 +15,6 @@ Database tersimpan langsung di Google Drive milik pengguna.
 
 ---
 
-## 📸 Preview
-
-### 💳 Aplication
-
-![Aplication](screenshots/Screenshot_1.png)  ![Aplication](screenshots/Screenshot_2.png)
-![Aplication](screenshots/Screenshot_3.png)  ![Aplication](screenshots/Screenshot_4.png)
-![Aplication](screenshots/Screenshot_5.png)  ![Aplication](screenshots/Screenshot_6.png)
-
-
-### 📊 Spreadsheet Database
-
-![Database](screenshots/Screenshot_7.png)
-![Database](screenshots/Screenshot_8.png)
-
----
-
 ## ✨ Features
 
 ### 🔐 Session-Based Auto Login
@@ -243,15 +227,6 @@ frontend/Index.html
 * **No External Server** — Tidak ada data dikirim ke pihak ketiga
 * **Data Ownership** — Data tersimpan di Google Drive pengguna sendiri
 * **Auditable** — Source code dapat diaudit kapan saja
-
----
-
-## 📜 License
-
-![License](https://img.shields.io/badge/license-MIT-34d399?style=flat-square)
-
-© 2026 Catur Wardana
-For personal use.
 
 ---
 
