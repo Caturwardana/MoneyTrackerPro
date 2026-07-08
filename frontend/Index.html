@@ -133,7 +133,7 @@
         <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-master" type="button"
             onclick="renderMasterData()">Master</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-ex"
-            type="button">Ekspor</button></li>
+            type="button" onclick="setExportDefaultDates()">Ekspor</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-rekap" type="button"
             onclick="tabLoaded.rekap=true;fetchMonthlyRecap()">Rekap</button></li>
       </ul>
@@ -461,7 +461,7 @@
       const pin = document.getElementById('pinInput').value.trim();
       if (!pin) { if (!isAuto) alert('PIN wajib diisi'); return; }
       invalidateFrontendCache();
-      runServer('loginInit', pin, (res) => {
+      runServer('loginSession', pin, (res) => {
         currentUser = res.user;
         masterData = { users: res.users || [], categories: (res.masterData && res.masterData.categories) || [], wallets: (res.masterData && res.masterData.wallets) || [] };
         const masterCacheKey = `master:${currentUser.id}`;
@@ -475,12 +475,12 @@
         } catch (e) { }
 
         document.getElementById('pinInput').value = '';
-        localStorage.setItem('savedPin', pin);
+        localStorage.setItem('sessionToken', res.sessionToken);
         showAppShell();
         initializeAfterLogin();
       }, {
         onError: () => {
-          if (isAuto) { localStorage.removeItem('savedPin'); document.getElementById('pinInput').value = ''; return; }
+          if (isAuto) { localStorage.removeItem('sessionToken'); document.getElementById('pinInput').value = ''; return; }
           alert('PIN salah atau terjadi kesalahan server');
           document.getElementById('pinInput').value = '';
         }
@@ -501,9 +501,11 @@
     }
 
     function logout() {
+      const token = localStorage.getItem('sessionToken');
       currentUser = null;
       invalidateFrontendCache();
-      localStorage.removeItem('savedPin');
+      localStorage.removeItem('sessionToken');
+      if (token) runServer('destroySession', token, null, { showLoader: false });
       updateCurrentUserDisplay();
       document.getElementById('login-screen').style.display = 'block';
       document.getElementById('app-shell').style.display = 'none';
@@ -517,6 +519,7 @@
     let tabLoaded = { input: false, riwayat: false, statistik: false, rekap: false };
     function initializeAfterLogin() {
       updateCurrentUserDisplay();
+      setDefaultDate();
       document.getElementById('admin-user-management').style.display = currentUser && currentUser.isAdmin ? 'block' : 'none';
       loadMasterData(() => {
         toggleUI();
@@ -785,10 +788,10 @@
       document.getElementById('recapYear').textContent = reqYear;
       document.getElementById('recap-loader').style.display = 'block';
       runServer('getMonthlyRecap', { year: reqYear, userId: currentUser.id }, (data) => {
-        if (recapYear !== reqYear) { document.getElementById('recap-loader').style.display = 'none'; return; }
+        if (!data || data.year != recapYear) { document.getElementById('recap-loader').style.display = 'none'; return; }
         recapData = data;
         document.getElementById('recap-loader').style.display = 'none';
-        try { renderRecap(); } catch (e) { console.error(e); }
+        renderRecap();
       }, { showLoader: false, onError: () => { document.getElementById('recap-loader').style.display = 'none'; } });
     }
 
@@ -796,16 +799,25 @@
       if (!currentUser) return;
       recapYear += delta;
       document.getElementById('recapYear').textContent = recapYear;
-      fetchMonthlyRecap();
+      document.getElementById('recapContent').innerHTML = '';
+      document.getElementById('recap-loader').style.display = 'block';
+      runServer('getMonthlyRecap', { year: recapYear, userId: currentUser.id }, (data) => {
+        if (!data || data.year != recapYear) { document.getElementById('recap-loader').style.display = 'none'; return; }
+        recapData = data;
+        document.getElementById('recap-loader').style.display = 'none';
+        renderRecap();
+      }, { showLoader: false, onError: () => { document.getElementById('recap-loader').style.display = 'none'; } });
     }
 
     function renderRecap() {
       if (!recapData || !recapData.months) return;
       const months = recapData.months;
-      let totalIncome = 0, totalExpense = 0;
+      const year = recapData.year;
+      let totalIncome = 0, totalExpense = 0, totalCount = 0;
       const bars = months.map(m => {
         totalIncome += m.income;
         totalExpense += m.expense;
+        totalCount += m.count;
         const maxVal = Math.max(m.income, m.expense, 1);
         const hInc = Math.round((m.income / maxVal) * 100);
         const hExp = Math.round((m.expense / maxVal) * 100);
@@ -820,6 +832,15 @@
       </div>`;
       }).join('');
       const totalSaldo = totalIncome - totalExpense;
+      if (totalCount === 0) {
+        document.getElementById('recapContent').innerHTML = `
+        <div class="text-center py-4">
+          <div style="font-size:2rem;margin-bottom:8px;opacity:0.5;">📭</div>
+          <div class="fw-bold text-muted">Belum ada transaksi di tahun ${year}</div>
+          <div class="small text-muted mt-1" style="opacity:0.7;">Tambahkan transaksi di tab Input</div>
+        </div>`;
+        return;
+      }
       document.getElementById('recapContent').innerHTML = `
       <div class="d-flex justify-content-around mb-3 text-center small">
         <div><div class="fw-bold text-success">+Rp ${totalIncome.toLocaleString('id-ID')}</div><div style="font-size:0.6rem;color:var(--text-muted);">Total Pemasukan</div></div>
@@ -1047,20 +1068,51 @@
     // [UTIL] Set nilai default input tanggal ke waktu sekarang
     function setDefaultDate() { const now = new Date(); now.setMinutes(now.getMinutes() - now.getTimezoneOffset()); document.getElementById('tglInput').value = now.toISOString().slice(0, 16); }
 
+    // [UTIL] Set default tanggal awal dan akhir di tab export ke tanggal hari ini
+    function setExportDefaultDates() {
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = ('0' + (now.getMonth() + 1)).slice(-2);
+      const dd = ('0' + now.getDate()).slice(-2);
+      const today = `${yyyy}-${mm}-${dd}`;
+      const s = document.getElementById('ex-start');
+      const e = document.getElementById('ex-end');
+      if (s && !s.value) s.value = today;
+      if (e && !e.value) e.value = today;
+    }
+
     // [API] Ambil pratinjau data untuk kebutuhan ekspor
     function processExport() { const s = document.getElementById('ex-start').value, e = document.getElementById('ex-end').value; if (!s || !e) { alert("Pilih tanggal!"); return; } runServer("getExportData", { start: s, end: e, userId: currentUser ? currentUser.id : null }, data => { document.getElementById('export-preview-area').style.setProperty('display', 'block', 'important'); document.getElementById('export-body').innerHTML = data.map(r => `<tr><td>${r.kode}</td><td>${r.tgl}</td><td>${escapeHtml(r.wallet)}</td><td>${escapeHtml(r.keterangan)}</td><td>${escapeHtml(r.catatan)}</td><td class="text-success">${r.debit ? 'Rp ' + r.debit.toLocaleString('id-ID') : '-'}</td><td class="text-danger">${r.kredit ? 'Rp ' + r.kredit.toLocaleString('id-ID') : '-'}</td><td>Rp ${r.total.toLocaleString('id-ID')}</td></tr>`).join(''); }); }
 
     // [UTIL] Generate dan download file CSV dari tabel pratinjau
     function downloadCSV() { const table = document.getElementById("table-export"); let csv = []; for (let i = 0; i < table.rows.length; i++) { let row = [], cols = table.rows[i].querySelectorAll("td, th"); for (let j = 0; j < cols.length; j++) row.push('"' + cols[j].innerText.replace(/Rp\s?|(?<=\d)\.(?=\d{3})/g, '').replace(/\n/g, ' ') + '"'); csv.push(row.join(",")); } const blob = new Blob(["\uFEFF" + csv.join("\n")], { type: "text/csv;charset=utf-8;" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Export_${new Date().getTime()}.csv`; document.body.appendChild(link); link.click(); document.body.removeChild(link); }
 
-    // [INIT] Jalankan fungsi inisialisasi saat window dimuat
+    // [INIT] Jalankan auto-login menggunakan session token
     function tryAutoLogin() {
-      const savedPin = localStorage.getItem('savedPin');
-      if (savedPin) {
-        const pinInput = document.getElementById('pinInput');
-        if (pinInput) pinInput.value = savedPin;
-        setTimeout(() => handleLogin(true), 0);
-      }
+      const token = localStorage.getItem('sessionToken');
+      if (!token) return;
+      loading(true);
+      runServer('verifyAutoLogin', token, (res) => {
+        loading(false);
+        if (!res || !res.user) {
+          localStorage.removeItem('sessionToken');
+          return;
+        }
+        currentUser = res.user;
+        masterData = { users: res.users || [], categories: (res.masterData && res.masterData.categories) || [], wallets: (res.masterData && res.masterData.wallets) || [] };
+        const masterCacheKey = `master:${currentUser.id}`;
+        setCachedValue(masterCacheKey, masterData, FRONTEND_CACHE_TTL.master);
+        try { setCachedValue(`transactions:${currentUser.id}:${JSON.stringify(hF)}`, res.transactions || [], FRONTEND_CACHE_TTL.transactions); } catch (e) { }
+        try { setCachedValue(`dashboard:${currentUser.id}:${JSON.stringify(sF)}`, res.dashboard || {}, FRONTEND_CACHE_TTL.dashboard); } catch (e) { }
+        showAppShell();
+        initializeAfterLogin();
+      }, {
+        showLoader: false,
+        onError: () => {
+          loading(false);
+          localStorage.removeItem('sessionToken');
+        }
+      });
     }
     function toggleTheme() {
       const html = document.documentElement;
@@ -1076,7 +1128,11 @@
         document.getElementById('themeToggle').innerText = '☀️';
       }
     })();
-    window.onload = () => { try { setDefaultDate(); } catch (e) {} updateCurrentUserDisplay(); tryAutoLogin(); };
+    (function init() {
+      try { setDefaultDate(); } catch (e) {}
+      updateCurrentUserDisplay();
+      setTimeout(tryAutoLogin, 300);
+    })();
   </script>
   <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="Toggle dark mode">🌙</button>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>

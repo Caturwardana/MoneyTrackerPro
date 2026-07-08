@@ -171,6 +171,47 @@ function loginInit(pin) {
   };
 }
 
+const SESSION_CACHE_PREFIX = 'sess_';
+const SESSION_TTL_SECONDS = 86400; // 24 jam
+
+function loginSession(pin) {
+  const result = loginInit(pin);
+  const token = generateId();
+  CACHE.put(SESSION_CACHE_PREFIX + token, result.user.id, SESSION_TTL_SECONDS);
+  result.sessionToken = token;
+  return result;
+}
+
+function verifyAutoLogin(token) {
+  ensureAppSetup();
+  if (!token) return null;
+  const userId = CACHE.get(SESSION_CACHE_PREFIX + token);
+  if (!userId) return null;
+  // Refresh session TTL
+  CACHE.put(SESSION_CACHE_PREFIX + token, userId, SESSION_TTL_SECONDS);
+  const user = getUserById(userId);
+  if (!user) return null;
+  const masterData = getMasterData(userId);
+  const start = new Date();
+  start.setDate(start.getDate() - 30);
+  const end = new Date();
+  end.setHours(23, 59, 59);
+  return {
+    user: { id: user.id, name: user.name, isAdmin: user.isAdmin },
+    users: masterData.users,
+    masterData: {
+      categories: masterData.categories,
+      wallets: masterData.wallets
+    },
+    transactions: getTransactions({ userId, tipe: 'Semua', start: start.toISOString(), end: end.toISOString() }),
+    dashboard: getDashboardData({ userId, tipe: 'Pengeluaran', start: start.toISOString(), end: end.toISOString() })
+  };
+}
+
+function destroySession(token) {
+  if (token) CACHE.remove(SESSION_CACHE_PREFIX + token);
+}
+
 function createUser(payload) {
   ensureAppSetup();
   const name = String(payload && payload.name ? payload.name : '').trim();
